@@ -26,6 +26,26 @@ lerobot-teleoperate \
 The plugin self-registers via `@RobotConfig.register_subclass("piper_follower")`,
 so the robot type is available on every LeRobot CLI after install.
 
+## Piper + RH56F2 Keyboard Teleop
+
+The latest keyboard teleop script controls the Piper arm and Inspire RH56F2 hand
+through joint commands:
+
+```bash
+python scripts/keyboard_teleop_piper_hand.py \
+    --can-port can0 \
+    --hand-port /dev/ttyUSB0
+```
+
+For single-command debugging:
+
+```bash
+python scripts/keyboard_teleop_piper_hand.py --line-mode
+```
+
+On exit, the script asks you to type `D` before disabling Piper motors, so the
+arm can be supported first.
+
 ## Why this plugin
 
 Most public Piper×LeRobot wrappers enable the arm at full speed, send a single
