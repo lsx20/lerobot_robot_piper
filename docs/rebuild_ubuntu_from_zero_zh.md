@@ -421,7 +421,7 @@ python scripts/pick_place_ball.py --capture place
 python scripts/pick_place_ball.py --sync-current-joint6
 ```
 
-不要随便加 `--yes-disable`，除非你托住机械臂。
+退出程序时必须托住机械臂，并按提示输入大写 `D` 才会失能电机。
 
 ## 17. 键盘遥控
 
@@ -657,7 +657,6 @@ python ~/piper_read_health.py
 - 不确认姿态时，不运行自动抓取
 - 不确认温度时，不连续长时间抓娃娃模式
 - 退出使能前托住机械臂和灵巧手
-- 尽量不要使用 `--yes-disable`
+- 不要绕过退出确认；失能电机前必须先托住机械臂并输入大写 `D`
 - 出现发热、异响、抖动、砸落趋势，立刻停脚本并断电冷却
 - 每次迁移到新电脑，先只读健康检查，再运动
-

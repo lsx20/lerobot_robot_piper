@@ -302,8 +302,18 @@ class PiperFollower(Robot):
         self._move_to_rest()
 
         if self.piper is not None:
-            self.piper.DisableArm()
-            self.piper.GripperCtrl(0, 0, 0x00, 0)
+            print()
+            print("WARNING: disabling Piper motors may make the arm drop.")
+            print("Hold/support the arm before disabling.")
+            confirm = input(
+                "Type D then Enter to disable arm motors, or press Enter to keep motors enabled: "
+            ).strip()
+            if confirm == "D":
+                self.piper.DisableArm()
+                self.piper.GripperCtrl(0, 0, 0x00, 0)
+                logger.info("Piper arm motors disabled by user confirmation.")
+            else:
+                logger.info("Piper arm motors left enabled; no DisableArm command sent.")
         for cam in self.cameras.values():
             cam.disconnect()
         self._is_connected = False

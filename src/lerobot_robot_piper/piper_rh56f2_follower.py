@@ -179,18 +179,17 @@ class PiperRH56F2Follower(Robot):
     @check_if_not_connected
     def disconnect(self) -> None:
         if self.piper is not None:
-            if self.config.prompt_before_disable:
-                print()
-                print("WARNING: disabling Piper motors may make the arm drop.")
-                print("Hold/support the arm and hand before disabling.")
-                confirm = input("Type D then Enter to disable arm motors, or press Enter to keep motors enabled: ").strip()
-                if confirm == "D":
-                    self.piper.DisableArm(7)
-                    logger.info("Piper arm motors disabled by user confirmation.")
-                else:
-                    logger.info("Piper arm motors left enabled; no DisableArm command sent.")
-            else:
+            print()
+            print("WARNING: disabling Piper motors may make the arm drop.")
+            print("Hold/support the arm and hand before disabling.")
+            confirm = input(
+                "Type D then Enter to disable arm motors, or press Enter to keep motors enabled: "
+            ).strip()
+            if confirm == "D":
                 self.piper.DisableArm(7)
+                logger.info("Piper arm motors disabled by user confirmation.")
+            else:
+                logger.info("Piper arm motors left enabled; no DisableArm command sent.")
         if self.hand is not None:
             self.hand.disconnect()
         for cam in self.cameras.values():

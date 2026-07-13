@@ -215,7 +215,7 @@ def connect_robot(args) -> PiperRH56F2Follower:
         can_port=args.can_port,
         speed_rate=args.speed_rate,
         max_arm_delta_deg=args.max_arm_delta_deg,
-        prompt_before_disable=not args.yes_disable,
+        prompt_before_disable=True,
         clip_joint6_to_sdk_limits=False,
         hand_port=args.hand_port,
         hand_baudrate=args.hand_baudrate,
@@ -774,7 +774,6 @@ def main() -> None:
     parser.add_argument("--max-hand-delta", type=float, default=120.0)
     parser.add_argument("--waypoints", type=Path, default=DEFAULT_WAYPOINTS)
     parser.add_argument("--lock-joint6", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--yes-disable", action="store_true")
     parser.add_argument("--move-seconds", type=float, default=4.0)
     parser.add_argument("--approach-seconds", type=float, default=2.0)
     parser.add_argument("--control-hz", type=float, default=50.0)

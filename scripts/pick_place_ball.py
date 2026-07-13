@@ -129,7 +129,7 @@ def run_pick_place(args) -> None:
         can_port=args.can_port,
         speed_rate=args.speed_rate,
         max_arm_delta_deg=args.max_arm_delta_deg,
-        prompt_before_disable=not args.yes_disable,
+        prompt_before_disable=True,
         clip_joint6_to_sdk_limits=args.clip_joint6_to_sdk_limits,
         hand_port=args.hand_port,
         hand_baudrate=args.hand_baudrate,
@@ -220,11 +220,6 @@ def main() -> None:
     parser.add_argument("--hand-test", action="store_true")
     parser.add_argument("--lock-joint6", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--clip-joint6-to-sdk-limits", action="store_true")
-    parser.add_argument(
-        "--yes-disable",
-        action="store_true",
-        help="Disable arm motors on exit without asking. Do not use unless the arm is physically supported.",
-    )
     parser.add_argument("--move-seconds", type=float, default=4.0)
     parser.add_argument("--approach-seconds", type=float, default=2.0)
     args = parser.parse_args()

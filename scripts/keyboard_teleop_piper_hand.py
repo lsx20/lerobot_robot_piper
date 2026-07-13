@@ -360,7 +360,7 @@ def run(args: argparse.Namespace) -> None:
         can_port=args.can_port,
         speed_rate=args.speed_rate,
         max_arm_delta_deg=args.max_arm_delta_deg,
-        prompt_before_disable=not args.yes_disable,
+        prompt_before_disable=True,
         clip_joint6_to_sdk_limits=args.clip_joint6_to_sdk_limits,
         hand_port=args.hand_port,
         hand_baudrate=args.hand_baudrate,
@@ -453,11 +453,6 @@ def main() -> None:
     parser.add_argument("--claw-lock-j4-deg", type=float, default=SAVED_CLAW_J4_DEG)
     parser.add_argument("--claw-lock-j6-deg", type=float, default=SAVED_CLAW_J6_DEG)
     parser.add_argument("--clip-joint6-to-sdk-limits", action="store_true")
-    parser.add_argument(
-        "--yes-disable",
-        action="store_true",
-        help="Disable Piper motors on exit without asking. Avoid this unless the arm is physically supported.",
-    )
     run(parser.parse_args())
 
 
