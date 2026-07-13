@@ -4,7 +4,6 @@
 Manual phase:
   w/s: MOVE_J reach forward/back
   a/d: MOVE_J base left/right
-  arrow keys: same as w/s/a/d
   space: open while descending, close at grab height, lift/drop, open, close while returning
 
 Manual keyboard control uses MOVE_J for smoother operator feel.
@@ -51,7 +50,6 @@ Controls
 
   w / s       reach forward / back with J2,J3,J5
   a / d       J1 left / right
-  arrow keys  same as WASD
   space       open while descending, close at grab height, lift/drop, open, close while returning
   p           print current pose
   r           reset the teleop reference to current pose
@@ -59,6 +57,8 @@ Controls
 
 Use Ctrl-C only if the key loop is unresponsive.
 """
+
+DEFAULT_START_POSE = [325809, 23336, 268832, 173269, 27298, 172930]
 
 
 class RawTerminal:
@@ -77,14 +77,8 @@ def read_key(timeout_s: float = 0.1) -> str | None:
     if not ready:
         return None
     key = sys.stdin.read(1)
-    if key == "\x1b":
-        rest = ""
-        deadline = time.time() + 0.03
-        while time.time() < deadline:
-            if not select.select([sys.stdin], [], [], 0.001)[0]:
-                continue
-            rest += sys.stdin.read(1)
-        return key + rest
+    while select.select([sys.stdin], [], [], 0.0)[0]:
+        key = sys.stdin.read(1)
     return key
 
 
@@ -408,15 +402,34 @@ def send_movej_for(
     return True
 
 
+def send_movej_once(
+    piper: C_PiperInterface_V2,
+    target: list[float],
+    speed: int,
+) -> bool:
+    if not joint_limits_ok(target):
+        print(f"\n[warn] MOVE_J target outside limits: {fmt_joints(target)}")
+        return False
+    raw = [int(round(joint * 1000.0)) for joint in target]
+    piper.MotionCtrl_2(0x01, 0x01, speed, 0x00)
+    piper.JointCtrl(*raw)
+    enable_status = list(piper.GetArmEnableStatus())
+    arm_status = arm_status_code(piper)
+    if not all(enable_status) or arm_status != 0x00:
+        print(f"\n[warn] MOVE_J send failed: arm=0x{arm_status:x} enable={enable_status}")
+        return False
+    return True
+
+
 def key_to_joint_move(key: str) -> tuple[str, int] | None:
     key = key.lower()
-    if key in ("w", "\x1b[A"):
+    if key == "w":
         return "forward", 0
-    if key in ("s", "\x1b[B"):
+    if key == "s":
         return "back", 1
-    if key in ("d", "\x1b[C"):
+    if key == "d":
         return "right", 2
-    if key in ("a", "\x1b[D"):
+    if key == "a":
         return "left", 3
     return None
 
@@ -430,6 +443,7 @@ def apply_joint_step(
     reach_pre_gains: tuple[float, float, float],
     reach_post_gains: tuple[float, float, float],
     locked_j4: float,
+    locked_j5: float,
     locked_j6: float,
 ) -> tuple[list[float], str]:
     def apply_reach_gains(
@@ -485,6 +499,7 @@ def apply_joint_step(
         phase = apply_reach(next_target, 1.0)
     elif direction == 1:
         phase = apply_reach(next_target, -1.0)
+        next_target[4] = locked_j5
     elif direction == 2:
         next_target[0] += j1_step
         phase = "base"
@@ -638,16 +653,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reach-step-deg", type=float, default=2.0)
     parser.add_argument("--reach-transition-j2-deg", type=float, default=35.0)
     parser.add_argument("--reach-pre-j2-gain", type=float, default=1.0)
-    parser.add_argument("--reach-pre-j3-gain", type=float, default=-0.35)
-    parser.add_argument("--reach-pre-j5-gain", type=float, default=-0.65)
+    parser.add_argument("--reach-pre-j3-gain", type=float, default=-1.2)
+    parser.add_argument("--reach-pre-j5-gain", type=float, default=-0.15)
     parser.add_argument("--reach-post-j2-gain", type=float, default=1.0)
-    parser.add_argument("--reach-post-j3-gain", type=float, default=-0.85)
+    parser.add_argument("--reach-post-j3-gain", type=float, default=-1.2)
     parser.add_argument("--reach-post-j5-gain", type=float, default=-0.15)
     parser.add_argument("--reach-j2-gain", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--reach-j3-gain", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--reach-j5-gain", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--nudge-duration", type=float, default=0.5)
-    parser.add_argument("--start", type=parse_pose_mm_deg)
+    parser.add_argument("--start", type=parse_pose_mm_deg, default=list(DEFAULT_START_POSE))
     parser.add_argument("--start-duration", type=float, default=8.0)
     parser.add_argument("--hover-z", type=float)
     parser.add_argument("--hover-duration", type=float, default=6.0)
@@ -798,18 +813,22 @@ def main() -> int:
             return 1
         joint_target = joints_deg(piper)
         locked_j4 = joint_target[3]
+        locked_j5 = joint_target[4]
         locked_j6 = joint_target[5]
 
         drop_pose = list(args.drop) if args.drop is not None else list(start_pose)
         print(f"Captured start pose: {pose_mm_deg(start_pose)}")
         print(f"Keyboard pose:       {pose_mm_deg(keyboard_pose)}")
         print(f"Keyboard joints:     {fmt_joints(joint_target)}")
-        print(f"Locked J4/J6:        J4={locked_j4:.3f} J6={locked_j6:.3f}")
+        print(
+            "Locked joints:       "
+            f"J4={locked_j4:.3f} J5-back={locked_j5:.3f} J6={locked_j6:.3f}"
+        )
         print(f"Drop pose:           {pose_mm_deg(drop_pose)}")
         set_hand(hand, DEFAULT_CLOSED, "keyboard close")
         print("Keyboard control is active.")
         print("Raw keyboard mode is active: typed keys are not echoed by the terminal.")
-        print("Use WASD or arrow keys; each accepted key will print a MOVE_J target.")
+        print("Use WASD; each accepted key will print a MOVE_J target.")
 
         with RawTerminal():
             while True:
@@ -826,6 +845,7 @@ def main() -> int:
                 if key_lower == "r":
                     joint_target = joints_deg(piper)
                     locked_j4 = joint_target[3]
+                    locked_j5 = joint_target[4]
                     locked_j6 = joint_target[5]
                     print(f"\nreference reset joints: {fmt_joints(joint_target)}")
                     continue
@@ -844,6 +864,7 @@ def main() -> int:
                         break
                     joint_target = joints_deg(piper)
                     locked_j4 = joint_target[3]
+                    locked_j5 = joint_target[4]
                     locked_j6 = joint_target[5]
                     print(f"cycle {'complete' if ok else 'stopped'}; current joints={fmt_joints(joint_target)}")
                     continue
@@ -870,22 +891,13 @@ def main() -> int:
                         args.reach_post_j5_gain,
                     ),
                     locked_j4,
+                    locked_j5,
                     locked_j6,
                 )
 
                 joint_target = next_target
-                print(
-                    f"\nkey {label} [{phase}]: "
-                    f"target joints {fmt_joints(joint_target)}"
-                )
-                if not send_movej_for(
-                    piper,
-                    joint_target,
-                    args.speed,
-                    args.nudge_duration,
-                    args.rate_hz,
-                    label,
-                ):
+                print(f"\rkey {label} [{phase}]: target joints {fmt_joints(joint_target)}", end="", flush=True)
+                if not send_movej_once(piper, joint_target, args.speed):
                     print("[warn] nudge failed; stop sending commands and reset if needed.")
                     break
 
