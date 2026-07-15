@@ -54,6 +54,8 @@ def run_pick_cycle(
         print("[warn] descend failed")
         return False
 
+    if args.pre_grab_open_settle > 0:
+        time.sleep(args.pre_grab_open_settle)
     close_at_grab(hand)
     time.sleep(args.hand_settle)
 
@@ -86,7 +88,7 @@ def run_pick_cycle(
         return False
 
     open_at_drop(hand)
-    time.sleep(args.hand_settle)
+    time.sleep(args.drop_open_settle)
 
     close_while_returning(hand)
     if not send_movep_for(

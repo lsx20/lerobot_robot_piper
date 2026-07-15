@@ -355,11 +355,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto-rpy-tolerance-deg", type=float, default=2.0)
     parser.add_argument("--drop", type=parse_pose_mm_deg)
     parser.add_argument("--hand-settle", type=float, default=1.0)
+    parser.add_argument("--pre-grab-open-settle", type=float, default=1.0)
+    parser.add_argument("--drop-open-settle", type=float, default=4.0)
     parser.add_argument("--no-hand", action="store_true")
     parser.add_argument("--hand-port", default="/dev/ttyUSB0")
     parser.add_argument("--hand-id", type=int, default=1)
     parser.add_argument("--hand-speed", type=int, default=800)
     parser.add_argument("--hand-force", type=int, default=1500)
+    parser.add_argument("--control", choices=("keyboard", "gamepad"), default="keyboard")
+    parser.add_argument("--gamepad-device", default="/dev/input/js0")
+    parser.add_argument("--gamepad-deadzone", type=float, default=0.18)
+    parser.add_argument("--gamepad-axis-x", type=int, default=0)
+    parser.add_argument("--gamepad-axis-y", type=int, default=1)
+    parser.add_argument("--gamepad-invert-y", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gamepad-j1-speed-dps", type=float, default=8.0)
+    parser.add_argument("--gamepad-reach-speed-dps", type=float, default=6.0)
+    parser.add_argument("--gamepad-axis-curve", type=float, default=1.8)
+    parser.add_argument("--gamepad-print-interval", type=float, default=0.2)
+    parser.add_argument("--gamepad-lead-limit-deg", type=float, default=1.5)
+    parser.add_argument("--gamepad-stop-reset", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--yes", action="store_true")
     return parser
 
@@ -373,3 +387,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--reach-step-deg must be positive")
     if args.reach_pre_j2_gain <= 0 or args.reach_post_j2_gain <= 0:
         raise ValueError("reach J2 gains must be positive")
+    if args.hand_settle < 0 or args.pre_grab_open_settle < 0 or args.drop_open_settle < 0:
+        raise ValueError("hand settle times must be non-negative")
+    if not 0.0 <= args.gamepad_deadzone < 1.0:
+        raise ValueError("--gamepad-deadzone must be in [0, 1)")
+    if args.gamepad_j1_speed_dps <= 0 or args.gamepad_reach_speed_dps <= 0:
+        raise ValueError("gamepad speed values must be positive")
+    if args.gamepad_axis_curve < 1.0:
+        raise ValueError("--gamepad-axis-curve must be >= 1")
+    if args.gamepad_print_interval < 0:
+        raise ValueError("--gamepad-print-interval must be non-negative")
+    if args.gamepad_lead_limit_deg < 0:
+        raise ValueError("--gamepad-lead-limit-deg must be non-negative")

@@ -14,6 +14,7 @@ from claw_arm_keyboard import (
     send_movej_once,
 )
 from claw_hand_keyboard import close_for_keyboard, connect_hand, disconnect_hand
+from claw_gamepad import run_gamepad_loop
 from claw_init import (
     HELP,
     RawTerminal,
@@ -170,7 +171,7 @@ def main() -> int:
         f"post=({args.reach_post_j2_gain:.2f},{args.reach_post_j3_gain:.2f},"
         f"{args.reach_post_j5_gain:.2f})"
     )
-    print("Keyboard uses MOVE_J; pick/drop vertical cycle uses official MOVE_P.")
+    print(f"{args.control.capitalize()} uses MOVE_J; pick/drop vertical cycle uses official MOVE_P.")
     if not args.yes:
         answer = input("Type YES to continue: ").strip()
         if answer != "YES":
@@ -185,7 +186,10 @@ def main() -> int:
         wait_for_real_feedback(piper, args.feedback_timeout)
         print_state(piper)
         start_pose, keyboard_pose = move_to_start_and_hover(piper, args)
-        run_keyboard_loop(piper, hand, args, start_pose, keyboard_pose)
+        if args.control == "gamepad":
+            run_gamepad_loop(piper, hand, args, start_pose, keyboard_pose)
+        else:
+            run_keyboard_loop(piper, hand, args, start_pose, keyboard_pose)
     except KeyboardInterrupt:
         print("\nInterrupted. Motors were not disabled by this script.")
     except Exception as exc:
