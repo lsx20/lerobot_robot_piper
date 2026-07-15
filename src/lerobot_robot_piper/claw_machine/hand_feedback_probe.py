@@ -28,6 +28,15 @@ def diff_values(values: dict[str, float], baseline: dict[str, float]) -> dict[st
     return {name: values.get(name, 0.0) - baseline.get(name, 0.0) for name in HAND_NAMES}
 
 
+def fmt_ranked_abs(values: dict[str, float]) -> str:
+    ranked = sorted(
+        ((name, abs(values.get(name, 0.0))) for name in HAND_NAMES),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return " ".join(f"{name}={value:.1f}" for name, value in ranked)
+
+
 def read_optional(hand: RH56F2Hand, key: str) -> dict[str, float] | None:
     try:
         return hand.read_positions(key)
@@ -88,6 +97,7 @@ def main() -> int:
             if force is not None:
                 print(f"forceAct:       {fmt_values(force)}")
                 print(f"forceAct delta: {fmt_values(diff_values(force, baseline_force))}")
+                print(f"forceAbs rank:  {fmt_ranked_abs(force)}")
             if status is not None:
                 print(f"statusCode:     {fmt_values(status)}")
             if temp is not None:

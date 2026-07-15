@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,9 +22,14 @@ except Exception:  # pragma: no cover - arm-only mode.
 BALL_READY_OPEN = dict(DEFAULT_OPEN)
 BALL_READY_OPEN.update(
     {
-        # Keep the fingers and thumb bend open, but swing the thumb inward
-        # while the arm is descending toward the ball.
-        "thumb_swing": 900,
+        # Open wider than the normal standby pose, while swinging the thumb
+        # inward during descent so the hand arrives ready to scoop the ball.
+        "little": 1800,
+        "ring": 1800,
+        "middle": 1800,
+        "index": 1800,
+        "thumb_bend": 1500,
+        "thumb_swing": 700,
     }
 )
 
@@ -34,6 +40,16 @@ BALL_CLOSED.update(
         # thumb swung inward around the ball.
         "thumb_bend": 1060,
         "thumb_swing": 900,
+    }
+)
+
+THUMB_GESTURE = dict(DEFAULT_CLOSED)
+THUMB_GESTURE.update(
+    {
+        # Keep four fingers folded and straighten the thumb; the arm J6
+        # rotation decides whether this reads as thumbs-up or thumbs-down.
+        "thumb_bend": 1500,
+        "thumb_swing": 1800,
     }
 )
 
@@ -51,6 +67,18 @@ def set_hand(hand: object | None, pose: dict[str, float], label: str) -> bool:
     return True
 
 
+def set_hand_speed(hand: object | None, speed: int | None, label: str) -> bool:
+    if hand is None or speed is None:
+        return True
+    try:
+        hand.write_positions("speedSet", {name: speed for name in BALL_READY_OPEN})
+    except Exception as exc:
+        print(f"[warn] {label}: hand speed command failed: {exc}")
+        return False
+    print(f"{label}: hand speed set to {speed}")
+    return True
+
+
 def set_hand_async(hand: object | None, pose: dict[str, float], label: str) -> None:
     if hand is None:
         print(f"{label}: hand disabled; skipped")
@@ -62,16 +90,70 @@ def set_hand_async(hand: object | None, pose: dict[str, float], label: str) -> N
     threading.Thread(target=worker, daemon=True).start()
 
 
-def open_while_descending(hand: object | None) -> None:
-    set_hand_async(
-        hand,
-        BALL_READY_OPEN,
-        "open fingers and swing thumb inward while descending",
-    )
+def open_while_descending(hand: object | None, speed: int | None = None) -> None:
+    def worker() -> None:
+        set_hand_speed(hand, speed, "fast open while descending")
+        set_hand(hand, BALL_READY_OPEN, "wide open and swing thumb inward while descending")
+
+    if hand is None:
+        print("wide open and swing thumb inward while descending: hand disabled; skipped")
+        return
+    threading.Thread(target=worker, daemon=True).start()
 
 
-def close_at_grab(hand: object | None) -> bool:
+def close_at_grab(hand: object | None, speed: int | None = None) -> bool:
+    set_hand_speed(hand, speed, "restore close speed")
     return set_hand(hand, BALL_CLOSED, "close ball grasp")
+
+
+def object_held_by_force(
+    hand: object | None,
+    threshold: float,
+    required_names: list[str],
+    duration_s: float,
+    rate_hz: float,
+    required_samples: int,
+) -> bool:
+    if hand is None:
+        print("held check: hand disabled; assume empty")
+        return False
+
+    deadline = time.time() + duration_s
+    interval_s = 1.0 / rate_hz
+    consecutive = 0
+    best_consecutive = 0
+    last_active = {name: 0.0 for name in required_names}
+
+    while time.time() < deadline:
+        try:
+            values = hand.read_positions("forceAct")
+        except Exception as exc:
+            print(f"[warn] held check: forceAct read failed: {exc}; assume empty")
+            return False
+
+        last_active = {
+            name: abs(values.get(name, 0.0))
+            for name in required_names
+        }
+        if all(value >= threshold for value in last_active.values()):
+            consecutive += 1
+            best_consecutive = max(best_consecutive, consecutive)
+        else:
+            consecutive = 0
+        time.sleep(interval_s)
+
+    held = best_consecutive >= required_samples
+    force_text = " ".join(f"{name}={value:.1f}" for name, value in last_active.items())
+    print(
+        f"held check: {force_text}, threshold={threshold:.1f}, "
+        f"best_consecutive={best_consecutive}/{required_samples}, held={held}"
+    )
+    return held
+
+
+def show_thumb_gesture(hand: object | None, speed: int | None = None) -> bool:
+    set_hand_speed(hand, speed, "thumb gesture speed")
+    return set_hand(hand, THUMB_GESTURE, "thumb gesture")
 
 
 def open_at_drop(hand: object | None) -> bool:

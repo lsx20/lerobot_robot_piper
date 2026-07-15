@@ -113,6 +113,13 @@ def clamp_target_lead(target: list[float], actual: list[float], max_lead_deg: fl
     return limited
 
 
+def restore_locked_wrist(target: list[float], locked_j4: float, locked_j6: float) -> list[float]:
+    locked = list(target)
+    locked[3] = locked_j4
+    locked[5] = locked_j6
+    return locked
+
+
 def print_gamepad_help(args: Namespace) -> None:
     print("Gamepad control is active.")
     print(f"Device: {args.gamepad_device}")
@@ -187,8 +194,16 @@ def run_gamepad_loop(
                 if not wait_for_movej_ready(piper, args.speed, args.feedback_timeout):
                     print("[warn] MOVE_J did not become ready after pick cycle.")
                     break
-                joint_target, locked_j4, locked_j5, locked_j6 = capture_keyboard_reference(piper)
-                print(f"cycle {'complete' if ok else 'stopped'}; current joints={fmt_joints(joint_target)}")
+                joint_target, _, locked_j5, _ = capture_keyboard_reference(piper)
+                joint_target = restore_locked_wrist(joint_target, locked_j4, locked_j6)
+                if not send_movej_once(piper, joint_target, args.speed):
+                    print("[warn] failed to restore locked J4/J6 after returning to start.")
+                    break
+                print(
+                    f"cycle {'complete' if ok else 'stopped'}; "
+                    f"current joints={fmt_joints(joint_target)} "
+                    f"locked J4={locked_j4:.3f} J6={locked_j6:.3f}"
+                )
 
             x_axis = shaped_axis(
                 joystick.axis(args.gamepad_axis_x, args.gamepad_deadzone),

@@ -13,7 +13,7 @@ import tty
 from piper_sdk import C_PiperInterface_V2
 
 
-DEFAULT_START_POSE = [325809, 23336, 268832, 173269, 27298, 172930]
+DEFAULT_START_POSE = [381039, 12382, 429390, -178971, 67152, -177659]
 JOINT_LIMITS_DEG = [
     (-150.0, 150.0),
     (0.0, 180.0),
@@ -67,6 +67,13 @@ def parse_pose_mm_deg(value: str) -> list[int]:
     except ValueError as exc:
         raise argparse.ArgumentTypeError("pose values must be numbers") from exc
     return [int(round(item * 1000.0)) for item in values]
+
+
+def parse_name_list(value: str) -> list[str]:
+    names = [part.strip() for part in value.split(",") if part.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError("expected comma-separated names")
+    return names
 
 
 def end_pose_raw(piper: C_PiperInterface_V2) -> list[int]:
@@ -361,7 +368,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hand-port", default="/dev/ttyUSB0")
     parser.add_argument("--hand-id", type=int, default=1)
     parser.add_argument("--hand-speed", type=int, default=800)
+    parser.add_argument("--pre-grab-open-speed", type=int, default=1800)
     parser.add_argument("--hand-force", type=int, default=1500)
+    parser.add_argument("--held-force-threshold", type=float, default=130.0)
+    parser.add_argument(
+        "--held-force-fingers",
+        type=parse_name_list,
+        default=["thumb_bend", "thumb_swing", "index", "middle"],
+    )
+    parser.add_argument("--held-check-duration", type=float, default=1.0)
+    parser.add_argument("--held-check-rate-hz", type=float, default=5.0)
+    parser.add_argument("--held-required-samples", type=int, default=3)
+    parser.add_argument("--result-gesture", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--result-gesture-speed", type=int, default=20)
+    parser.add_argument("--result-gesture-j2-back-deg", type=float, default=30.0)
+    parser.add_argument("--result-gesture-j6-deg", type=float, default=90.0)
+    parser.add_argument("--result-thumb-speed", type=int, default=2500)
+    parser.add_argument("--result-thumb-settle", type=float, default=0.8)
+    parser.add_argument("--result-gesture-duration", type=float, default=6.0)
+    parser.add_argument("--result-gesture-hold-after", type=float, default=2.0)
+    parser.add_argument("--result-gesture-return-duration", type=float, default=2.5)
     parser.add_argument("--control", choices=("keyboard", "gamepad"), default="keyboard")
     parser.add_argument("--gamepad-device", default="/dev/input/js0")
     parser.add_argument("--gamepad-deadzone", type=float, default=0.18)
@@ -389,6 +415,31 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("reach J2 gains must be positive")
     if args.hand_settle < 0 or args.pre_grab_open_settle < 0 or args.drop_open_settle < 0:
         raise ValueError("hand settle times must be non-negative")
+    if args.hand_speed <= 0 or args.pre_grab_open_speed <= 0:
+        raise ValueError("hand speeds must be positive")
+    if args.held_force_threshold < 0:
+        raise ValueError("--held-force-threshold must be non-negative")
+    if args.held_check_duration <= 0 or args.held_check_rate_hz <= 0:
+        raise ValueError("held check duration/rate must be positive")
+    if args.held_required_samples <= 0:
+        raise ValueError("--held-required-samples must be positive")
+    valid_hand_names = {"little", "ring", "middle", "index", "thumb_bend", "thumb_swing"}
+    invalid_force_names = set(args.held_force_fingers) - valid_hand_names
+    if invalid_force_names:
+        raise ValueError(f"bad --held-force-fingers names: {sorted(invalid_force_names)}")
+    if args.result_gesture_speed < 0 or args.result_gesture_speed > 100:
+        raise ValueError("--result-gesture-speed must be in [0, 100]")
+    if args.result_thumb_speed <= 0:
+        raise ValueError("--result-thumb-speed must be positive")
+    if args.result_gesture_j2_back_deg < 0 or args.result_gesture_j6_deg < 0:
+        raise ValueError("result gesture angles must be non-negative")
+    if (
+        args.result_thumb_settle < 0
+        or args.result_gesture_duration < 0
+        or args.result_gesture_hold_after < 0
+        or args.result_gesture_return_duration < 0
+    ):
+        raise ValueError("result gesture durations must be non-negative")
     if not 0.0 <= args.gamepad_deadzone < 1.0:
         raise ValueError("--gamepad-deadzone must be in [0, 1)")
     if args.gamepad_j1_speed_dps <= 0 or args.gamepad_reach_speed_dps <= 0:
