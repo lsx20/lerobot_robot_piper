@@ -42,10 +42,23 @@ class PiperRH56F2Follower(Robot):
         self._is_connected = False
         self.cameras = make_cameras_from_configs(config.cameras)
 
+    def _enable_all(self, timeout_s: float = 5.0) -> bool:
+        deadline = time.time() + timeout_s
+        last_status: list[bool] = []
+        while time.time() < deadline:
+            self.piper.EnableArm(7, 0x02)
+            time.sleep(0.02)
+            last_status = list(self.piper.GetArmEnableStatus())
+            if last_status and all(last_status):
+                return True
+        logger.warning("Piper enable failed; final enable status=%s", last_status)
+        return False
+
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
         features: dict[str, type | tuple] = {f"{name}.pos": float for name in JOINT_NAMES}
         features.update({f"hand.{name}.pos": float for name in HAND_NAMES})
+        features.update({f"hand.{name}.force": float for name in HAND_NAMES})
         for cam_name in self.cameras:
             cam_cfg = self.config.cameras[cam_name]
             features[cam_name] = (cam_cfg.height, cam_cfg.width, 3)
@@ -74,19 +87,23 @@ class PiperRH56F2Follower(Robot):
     def connect(self, calibrate: bool = True) -> None:
         from piper_sdk import C_PiperInterface_V2
 
-        self.piper = C_PiperInterface_V2(self.config.can_port)
+        self.piper = C_PiperInterface_V2(
+            self.config.can_port,
+            judge_flag=False,
+            can_auto_init=False,
+            dh_is_offset=1,
+            start_sdk_fk_cal=True,
+        )
         self.piper.ConnectPort()
         time.sleep(0.2)
 
         self.piper.MotionCtrl_1(0x02, 0x00, 0x02)
         time.sleep(0.05)
-        self.piper.MotionCtrl_2(0x00, 0x01, 0, 0x00)
-        time.sleep(0.05)
         self.piper.MotionCtrl_2(0x01, 0x01, self.config.speed_rate, 0x00)
 
         start = self._arm_current_deg()
-        while not self.piper.EnablePiper():
-            time.sleep(0.01)
+        if not self._enable_all():
+            raise RuntimeError("Failed to enable Piper arm.")
         self._send_arm_deg(start, clip_limits=False)
 
         self.hand = RH56F2Hand(
@@ -145,6 +162,8 @@ class PiperRH56F2Follower(Robot):
 
         hand_pos = self.hand.read_positions("angleAct")
         obs.update({f"hand.{name}.pos": value for name, value in hand_pos.items()})
+        hand_force = self.hand.read_positions("forceAct")
+        obs.update({f"hand.{name}.force": value for name, value in hand_force.items()})
 
         for cam_key, cam in self.cameras.items():
             obs[cam_key] = cam.read_latest()

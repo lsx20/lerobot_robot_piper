@@ -170,6 +170,7 @@ def run_pick_cycle(
         hand,
         args.held_force_threshold,
         args.held_force_fingers,
+        args.held_force_alt_fingers,
         args.held_check_duration,
         args.held_check_rate_hz,
         args.held_required_samples,

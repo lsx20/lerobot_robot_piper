@@ -46,8 +46,8 @@ BALL_CLOSED.update(
 THUMB_GESTURE = dict(DEFAULT_CLOSED)
 THUMB_GESTURE.update(
     {
-        # Keep four fingers folded and straighten the thumb; the arm J6
-        # rotation decides whether this reads as thumbs-up or thumbs-down.
+        # Keep four fingers folded and straighten the thumb; J6 rotation
+        # decides whether this reads as thumbs-up or thumbs-down.
         "thumb_bend": 1500,
         "thumb_swing": 1800,
     }
@@ -110,6 +110,7 @@ def object_held_by_force(
     hand: object | None,
     threshold: float,
     required_names: list[str],
+    alternate_required_names: list[str],
     duration_s: float,
     rate_hz: float,
     required_samples: int,
@@ -122,7 +123,12 @@ def object_held_by_force(
     interval_s = 1.0 / rate_hz
     consecutive = 0
     best_consecutive = 0
-    last_active = {name: 0.0 for name in required_names}
+    groups = [required_names]
+    if alternate_required_names:
+        groups.append(alternate_required_names)
+    tracked_names = sorted({name for group in groups for name in group})
+    last_active = {name: 0.0 for name in tracked_names}
+    best_group = ""
 
     while time.time() < deadline:
         try:
@@ -133,11 +139,20 @@ def object_held_by_force(
 
         last_active = {
             name: abs(values.get(name, 0.0))
-            for name in required_names
+            for name in tracked_names
         }
-        if all(value >= threshold for value in last_active.values()):
+        active_group = next(
+            (
+                group
+                for group in groups
+                if all(last_active.get(name, 0.0) >= threshold for name in group)
+            ),
+            None,
+        )
+        if active_group is not None:
             consecutive += 1
             best_consecutive = max(best_consecutive, consecutive)
+            best_group = ",".join(active_group)
         else:
             consecutive = 0
         time.sleep(interval_s)
@@ -146,12 +161,16 @@ def object_held_by_force(
     force_text = " ".join(f"{name}={value:.1f}" for name, value in last_active.items())
     print(
         f"held check: {force_text}, threshold={threshold:.1f}, "
-        f"best_consecutive={best_consecutive}/{required_samples}, held={held}"
+        f"best_consecutive={best_consecutive}/{required_samples}, "
+        f"best_group={best_group or 'none'}, held={held}"
     )
     return held
 
 
-def show_thumb_gesture(hand: object | None, speed: int | None = None) -> bool:
+def show_thumb_gesture(
+    hand: object | None,
+    speed: int | None = None,
+) -> bool:
     set_hand_speed(hand, speed, "thumb gesture speed")
     return set_hand(hand, THUMB_GESTURE, "thumb gesture")
 

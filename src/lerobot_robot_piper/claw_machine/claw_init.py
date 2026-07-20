@@ -13,7 +13,7 @@ import tty
 from piper_sdk import C_PiperInterface_V2
 
 
-DEFAULT_START_POSE = [381039, 12382, 429390, -178971, 67152, -177659]
+DEFAULT_START_POSE = [115297, 1540, 286435, -178229, 62125, -177491]
 JOINT_LIMITS_DEG = [
     (-150.0, 150.0),
     (0.0, 180.0),
@@ -341,10 +341,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feedback-timeout", type=float, default=8.0)
     parser.add_argument("--j1-step-deg", type=float, default=2.0)
     parser.add_argument("--reach-step-deg", type=float, default=2.0)
-    parser.add_argument("--reach-transition-j2-deg", type=float, default=35.0)
+    parser.add_argument("--reach-transition-j2-deg", type=float, default=90.0)
     parser.add_argument("--reach-pre-j2-gain", type=float, default=1.0)
-    parser.add_argument("--reach-pre-j3-gain", type=float, default=-1.2)
-    parser.add_argument("--reach-pre-j5-gain", type=float, default=-0.15)
+    parser.add_argument("--reach-pre-j3-gain", type=float, default=-0.85)
+    parser.add_argument("--reach-pre-j5-gain", type=float, default=-0.05)
     parser.add_argument("--reach-post-j2-gain", type=float, default=1.0)
     parser.add_argument("--reach-post-j3-gain", type=float, default=-1.2)
     parser.add_argument("--reach-post-j5-gain", type=float, default=-0.15)
@@ -375,6 +375,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--held-force-fingers",
         type=parse_name_list,
         default=["thumb_bend", "thumb_swing", "index", "middle"],
+    )
+    parser.add_argument(
+        "--held-force-alt-fingers",
+        type=parse_name_list,
+        default=["thumb_bend", "thumb_swing", "index", "ring"],
     )
     parser.add_argument("--held-check-duration", type=float, default=1.0)
     parser.add_argument("--held-check-rate-hz", type=float, default=5.0)
@@ -427,6 +432,9 @@ def validate_args(args: argparse.Namespace) -> None:
     invalid_force_names = set(args.held_force_fingers) - valid_hand_names
     if invalid_force_names:
         raise ValueError(f"bad --held-force-fingers names: {sorted(invalid_force_names)}")
+    invalid_alt_force_names = set(args.held_force_alt_fingers) - valid_hand_names
+    if invalid_alt_force_names:
+        raise ValueError(f"bad --held-force-alt-fingers names: {sorted(invalid_alt_force_names)}")
     if args.result_gesture_speed < 0 or args.result_gesture_speed > 100:
         raise ValueError("--result-gesture-speed must be in [0, 100]")
     if args.result_thumb_speed <= 0:
