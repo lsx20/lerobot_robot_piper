@@ -16,6 +16,8 @@ from .rh56f2_hand import HAND_NAMES, RH56F2Hand, RH56F2HandConfig
 
 logger = logging.getLogger(__name__)
 
+EE_POSE_NAMES = ["ee.x", "ee.y", "ee.z", "ee.rx", "ee.ry", "ee.rz"]
+
 
 def _clip_step(goal: float, current: float, max_delta: float | None) -> float:
     if max_delta is None:
@@ -28,6 +30,7 @@ class PiperRH56F2Follower(Robot):
 
     API units:
       - arm joint positions: degrees
+      - end-effector pose: mm for x/y/z, degrees for rx/ry/rz
       - hand positions: RH56F2 register angle units
     """
 
@@ -57,6 +60,7 @@ class PiperRH56F2Follower(Robot):
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
         features: dict[str, type | tuple] = {f"{name}.pos": float for name in JOINT_NAMES}
+        features.update({name: float for name in EE_POSE_NAMES})
         features.update({f"hand.{name}.pos": float for name in HAND_NAMES})
         features.update({f"hand.{name}.force": float for name in HAND_NAMES})
         for cam_name in self.cameras:
@@ -67,6 +71,7 @@ class PiperRH56F2Follower(Robot):
     @cached_property
     def action_features(self) -> dict[str, type]:
         features: dict[str, type] = {f"{name}.pos": float for name in JOINT_NAMES}
+        features.update({name: float for name in EE_POSE_NAMES})
         features.update({f"hand.{name}.pos": float for name in HAND_NAMES})
         return features
 
@@ -121,7 +126,11 @@ class PiperRH56F2Follower(Robot):
             cam.connect()
 
         self._is_connected = True
-        logger.info("PiperRH56F2Follower connected: can=%s hand=%s", self.config.can_port, self.config.hand_port)
+        logger.info(
+            "PiperRH56F2Follower connected: can=%s hand=%s",
+            self.config.can_port,
+            self.config.hand_port,
+        )
 
     def calibrate(self) -> None:
         pass
@@ -134,7 +143,22 @@ class PiperRH56F2Follower(Robot):
         joint_msgs = self.piper.GetArmJointMsgs()
         js = joint_msgs.joint_state
         values = [js.joint_1, js.joint_2, js.joint_3, js.joint_4, js.joint_5, js.joint_6]
-        return {f"{name}.pos": value / 1000.0 for name, value in zip(JOINT_NAMES, values, strict=True)}
+        return {
+            f"{name}.pos": value / 1000.0
+            for name, value in zip(JOINT_NAMES, values, strict=True)
+        }
+
+    def _ee_current_mm_deg(self) -> dict[str, float]:
+        end_pose = self.piper.GetArmEndPoseMsgs().end_pose
+        values = [
+            end_pose.X_axis,
+            end_pose.Y_axis,
+            end_pose.Z_axis,
+            end_pose.RX_axis,
+            end_pose.RY_axis,
+            end_pose.RZ_axis,
+        ]
+        return {name: value / 1000.0 for name, value in zip(EE_POSE_NAMES, values, strict=True)}
 
     def _send_arm_deg(self, arm_action: dict[str, float], clip_limits: bool = True) -> None:
         current = self._arm_current_deg()
@@ -155,10 +179,26 @@ class PiperRH56F2Follower(Robot):
         self.piper.MotionCtrl_2(0x01, 0x01, self.config.speed_rate, 0x00)
         self.piper.JointCtrl(*values)
 
+    def _send_ee_mm_deg(self, ee_action: dict[str, float]) -> None:
+        current = self._ee_current_mm_deg()
+        values: list[int] = []
+        for name in EE_POSE_NAMES:
+            goal = float(ee_action.get(name, current[name]))
+            max_delta = (
+                self.config.max_ee_delta_mm
+                if name in {"ee.x", "ee.y", "ee.z"}
+                else self.config.max_ee_delta_deg
+            )
+            goal = _clip_step(goal, current[name], max_delta)
+            values.append(int(round(goal * 1000.0)))
+        self.piper.MotionCtrl_2(0x01, 0x00, self.config.speed_rate, 0x00)
+        self.piper.EndPoseCtrl(*values)
+
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         obs: RobotObservation = {}
         obs.update(self._arm_current_deg())
+        obs.update(self._ee_current_mm_deg())
 
         hand_pos = self.hand.read_positions("angleAct")
         obs.update({f"hand.{name}.pos": value for name, value in hand_pos.items()})
@@ -174,10 +214,26 @@ class PiperRH56F2Follower(Robot):
     def send_action(self, action: RobotAction) -> RobotAction:
         sent: RobotAction = {}
 
-        arm_action = {key: float(value) for key, value in action.items() if key in {f"{n}.pos" for n in JOINT_NAMES}}
+        arm_action = {
+            key: float(value)
+            for key, value in action.items()
+            if key in {f"{n}.pos" for n in JOINT_NAMES}
+        }
+        ee_action = {
+            key: float(value)
+            for key, value in action.items()
+            if key in set(EE_POSE_NAMES)
+        }
+        if arm_action and ee_action:
+            raise ValueError(
+                "Use either joint position actions or end-effector pose actions, not both."
+            )
         if arm_action:
             self._send_arm_deg(arm_action)
             sent.update(arm_action)
+        if ee_action:
+            self._send_ee_mm_deg(ee_action)
+            sent.update(ee_action)
 
         hand_action = {}
         for name in HAND_NAMES:

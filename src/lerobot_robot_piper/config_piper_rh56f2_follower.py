@@ -12,6 +12,8 @@ class PiperRH56F2FollowerConfig(RobotConfig):
     can_port: str = "can0"
     speed_rate: int = 30
     max_arm_delta_deg: float | None = 5.0
+    max_ee_delta_mm: float | None = 20.0
+    max_ee_delta_deg: float | None = 10.0
     prompt_before_disable: bool = True
     clip_arm_to_sdk_limits: bool = False
     clip_joint6_to_sdk_limits: bool = False
