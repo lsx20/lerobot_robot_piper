@@ -12,13 +12,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:
+    from claw_hand_grasp import set_hand
     from rh56f2_hand import DEFAULT_CLOSED, RH56F2Hand, RH56F2HandConfig
 except Exception:  # pragma: no cover - arm-only mode.
     DEFAULT_CLOSED = {}
     RH56F2Hand = None
     RH56F2HandConfig = None
 
-from claw_hand_grasp import set_hand
+    def set_hand(hand: object | None, pose: dict[str, float], label: str) -> bool:
+        print(f"{label}: hand module disabled; skipped")
+        return True
 
 
 def connect_hand(args: Namespace) -> object | None:

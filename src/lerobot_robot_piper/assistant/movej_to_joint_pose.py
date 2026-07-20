@@ -8,7 +8,6 @@ It is intended to verify joint-mode motion separately from Cartesian control.
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 
