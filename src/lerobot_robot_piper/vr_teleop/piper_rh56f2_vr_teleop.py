@@ -18,9 +18,7 @@ import json
 import math
 import socket
 import sys
-import threading
 import time
-from http import server
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -40,71 +38,6 @@ from lerobot_robot_piper.rh56f2_hand import (
     RH56F2Hand,
     RH56F2HandConfig,
 )
-
-
-class CameraWebPreview:
-    """Serve the latest annotated frame as a browser MJPEG stream."""
-
-    def __init__(self, host: str, port: int):
-        import cv2
-
-        self.cv2 = cv2
-        self._lock = threading.Lock()
-        self._jpeg = b""
-        preview = self
-
-        class Handler(server.BaseHTTPRequestHandler):
-            def do_GET(self) -> None:  # noqa: N802
-                if self.path == "/":
-                    body = (
-                        "<html><head><title>D455 hand teleop</title></head>"
-                        "<body style='margin:0;background:#111'>"
-                        "<img src='/stream.mjpg' style='max-width:100vw;max-height:100vh'>"
-                        "</body></html>"
-                    ).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                    return
-                if self.path != "/stream.mjpg":
-                    self.send_error(404)
-                    return
-                self.send_response(200)
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-                self.end_headers()
-                try:
-                    while True:
-                        with preview._lock:
-                            jpeg = preview._jpeg
-                        if jpeg:
-                            self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
-                            self.wfile.write(jpeg)
-                            self.wfile.write(b"\r\n")
-                            self.wfile.flush()
-                        time.sleep(0.04)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-
-            def log_message(self, *_args: object) -> None:
-                return
-
-        self.httpd = server.ThreadingHTTPServer((host, port), Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        self.thread.start()
-        self.url = f"http://127.0.0.1:{self.httpd.server_port}/"
-
-    def submit(self, frame: np.ndarray) -> None:
-        ok, encoded = self.cv2.imencode(".jpg", frame, [int(self.cv2.IMWRITE_JPEG_QUALITY), 80])
-        if ok:
-            with self._lock:
-                self._jpeg = encoded.tobytes()
-
-    def close(self) -> None:
-        self.httpd.shutdown()
-        self.httpd.server_close()
 
 
 def _clip_value(goal: float, current: float, max_delta: float | None) -> float:
@@ -306,168 +239,6 @@ class Quest3UDPInput:
             wrist_xyz_m=wrist_xyz_m,
             wrist_rpy_deg=None,
             finger_curls=landmarks_to_simple_curls(landmarks),
-            deadman=True,
-            landmarks=landmarks,
-        )
-
-
-class RealSenseHandInput:
-    """Read D455 color frames and convert MediaPipe landmarks to VRFrame.
-
-    The first D455 phase deliberately uses only hand landmarks.  Depth and
-    wrist pose will be added later for arm teleoperation; RH56F2 hand control
-    only needs the normalized finger curl values produced here.
-    """
-
-    def __init__(
-        self,
-        model_path: Path,
-        serial: str,
-        width: int,
-        height: int,
-        fps: int,
-        show_camera: bool,
-        preview_port: int,
-        min_detection: float,
-        min_tracking: float,
-        min_presence: float,
-        min_score: float,
-    ):
-        try:
-            import cv2
-            import mediapipe as mp
-            from mediapipe.tasks import python as mp_python
-            from mediapipe.tasks.python import vision
-            import pyrealsense2 as rs
-        except ImportError as exc:
-            raise RuntimeError(
-                "D455 input needs pyrealsense2, mediapipe, and opencv-python. "
-                "Install pyrealsense2 in the same Python environment used to run teleop."
-            ) from exc
-
-        if not model_path.exists():
-            raise RuntimeError(
-                f"MediaPipe model not found: {model_path}. "
-                "Use --realsense-model to pass gesture_recognizer.task."
-            )
-
-        self.cv2 = cv2
-        self.mp = mp
-        self.show_camera = show_camera
-        self.window_name = "D455 hand teleop"
-        self.preview = CameraWebPreview("127.0.0.1", preview_port) if show_camera else None
-        self.pipeline = rs.pipeline()
-        self.config = rs.config()
-        self._pipeline_started = False
-        if serial:
-            self.config.enable_device(serial)
-        self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        options = vision.GestureRecognizerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=1,
-            min_hand_detection_confidence=min_detection,
-            min_hand_presence_confidence=min_presence,
-            min_tracking_confidence=min_tracking,
-        )
-        self.recognizer = vision.GestureRecognizer.create_from_options(options)
-        self.last_timestamp_ms = 0
-        self.min_score = min_score
-        self.received_frames = 0
-        self.valid_frames = 0
-        self.no_hand_frames = 0
-        self.port = None
-        self._smoothed_curls: dict[str, float] | None = None
-        self.curl_smoothing = 0.35
-        self.last_raw_curls: dict[str, float] | None = None
-        self.last_smoothed_curls: dict[str, float] | None = None
-
-    def close(self) -> None:
-        self.recognizer.close()
-        if self._pipeline_started:
-            self.pipeline.stop()
-        if self.preview is not None:
-            self.preview.close()
-
-    def start(self) -> None:
-        self.pipeline.start(self.config)
-        self._pipeline_started = True
-
-    def poll(self) -> VRFrame | None:
-        frames = self.pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
-            return None
-
-        self.received_frames += 1
-        image_bgr = np.asanyarray(color_frame.get_data())
-        if self.preview is not None:
-            self.preview.submit(image_bgr)
-        image_rgb = self.cv2.cvtColor(image_bgr, self.cv2.COLOR_BGR2RGB)
-        mp_image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=image_rgb)
-        timestamp_ms = int(time.monotonic() * 1000)
-        if timestamp_ms <= self.last_timestamp_ms:
-            timestamp_ms = self.last_timestamp_ms + 1
-        self.last_timestamp_ms = timestamp_ms
-        result = self.recognizer.recognize_for_video(mp_image, timestamp_ms)
-
-        if not result.hand_landmarks:
-            self.no_hand_frames += 1
-            self._smoothed_curls = None
-            self.last_raw_curls = None
-            self.last_smoothed_curls = None
-            return None
-
-        hand_index = 0
-        if result.handedness:
-            for index, handedness in enumerate(result.handedness):
-                if handedness and handedness[0].category_name.lower() == "right":
-                    hand_index = index
-                    break
-        hand = result.hand_landmarks[hand_index]
-        landmarks = [float(value) for landmark in hand for value in (landmark.x, landmark.y, landmark.z)]
-        self.valid_frames += 1
-        if self.show_camera:
-            h, w = image_bgr.shape[:2]
-            for start, end in (
-                (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
-                (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15),
-                (15, 16), (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),
-            ):
-                p1 = (int(hand[start].x * w), int(hand[start].y * h))
-                p2 = (int(hand[end].x * w), int(hand[end].y * h))
-                self.cv2.line(image_bgr, p1, p2, (0, 220, 255), 2)
-            for landmark in hand:
-                self.cv2.circle(image_bgr, (int(landmark.x * w), int(landmark.y * h)), 4, (0, 80, 255), -1)
-            label = "hand detected"
-            if result.gestures and result.gestures[0]:
-                category = result.gestures[0][0]
-                if float(category.score) >= self.min_score:
-                    label = f"{category.category_name} {float(category.score):.2f}"
-            self.cv2.putText(image_bgr, label, (20, 35), self.cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            if self.preview is not None:
-                self.preview.submit(image_bgr)
-
-        # Wrist coordinates are normalized image coordinates for now. They
-        # are harmless in hand-only mode and reserved for later arm mapping.
-        wrist = hand[0]
-        raw_curls = landmarks_to_simple_curls(landmarks)
-        self.last_raw_curls = raw_curls
-        if self._smoothed_curls is None:
-            smoothed_curls = raw_curls
-        else:
-            smoothed_curls = {
-                name: self.curl_smoothing * raw_curls[name]
-                + (1.0 - self.curl_smoothing) * self._smoothed_curls[name]
-                for name in raw_curls
-            }
-        self._smoothed_curls = smoothed_curls
-        self.last_smoothed_curls = smoothed_curls
-
-        return VRFrame(
-            wrist_xyz_m=(float(wrist.x), float(wrist.y), float(wrist.z)),
-            wrist_rpy_deg=None,
-            finger_curls=smoothed_curls,
             deadman=True,
             landmarks=landmarks,
         )
@@ -773,23 +544,9 @@ def build_robot(args: argparse.Namespace) -> object:
     )
 
 
-def build_input(args: argparse.Namespace) -> Quest3UDPInput | RealSenseHandInput | None:
+def build_input(args: argparse.Namespace) -> Quest3UDPInput | None:
     if args.input_source == "quest3":
         return Quest3UDPInput(args.port)
-    if args.input_source == "realsense":
-        return RealSenseHandInput(
-            model_path=args.realsense_model,
-            serial=args.realsense_serial,
-            width=args.realsense_width,
-            height=args.realsense_height,
-            fps=args.realsense_fps,
-            show_camera=args.show_camera,
-            preview_port=args.preview_port,
-            min_detection=args.min_detection,
-            min_tracking=args.min_tracking,
-            min_presence=args.min_presence,
-            min_score=args.min_score,
-        )
     return None
 
 
@@ -808,29 +565,8 @@ def build_hand_mapper(args: argparse.Namespace) -> object:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--connect", action="store_true", help="Connect real Piper + RH56F2 hardware.")
-    parser.add_argument("--input-source", choices=["stdin", "quest3", "realsense"], default="stdin")
+    parser.add_argument("--input-source", choices=["stdin", "quest3"], default="quest3")
     parser.add_argument("--port", type=int, default=9000, help="Quest 3 UDP input port.")
-    parser.add_argument(
-        "--realsense-model",
-        type=Path,
-        default=Path(__file__).resolve().parents[1] / "rock_paper_scissors" / "gesture_recognizer.task",
-        help="MediaPipe hand model used with --input-source realsense.",
-    )
-    parser.add_argument("--realsense-serial", default="", help="Optional D455 serial number.")
-    parser.add_argument("--realsense-width", type=int, default=640)
-    parser.add_argument("--realsense-height", type=int, default=480)
-    parser.add_argument("--realsense-fps", type=int, default=30)
-    parser.add_argument("--show-camera", action="store_true", help="Show D455 image and detected hand landmarks.")
-    parser.add_argument(
-        "--print-curls",
-        action="store_true",
-        help="Print normalized finger curls and RH56F2 target angles while running.",
-    )
-    parser.add_argument("--preview-port", type=int, default=8765, help="Local browser preview port.")
-    parser.add_argument("--min-detection", type=float, default=0.7)
-    parser.add_argument("--min-tracking", type=float, default=0.5)
-    parser.add_argument("--min-presence", type=float, default=0.5)
-    parser.add_argument("--min-score", type=float, default=0.5)
     parser.add_argument("--hand-mode", choices=["simple", "anydex"], default="simple")
     parser.add_argument("--hand-config", type=Path)
     parser.add_argument("--anydex-root", type=Path, default=Path("third_party/AnyDexRetarget"))
@@ -878,11 +614,10 @@ def main() -> int:
         hand_mapper=hand_mapper,
     )
     interval_s = 1.0 / args.rate_hz
-    print(f"Initializing input source: {args.input_source} (show_camera={args.show_camera})", flush=True)
-    vr_input: Quest3UDPInput | RealSenseHandInput | None = None
+    print(f"Initializing input source: {args.input_source}", flush=True)
+    vr_input: Quest3UDPInput | None = None
     last_frame_time = time.monotonic()
     last_status_time = time.monotonic()
-    last_curls_time = time.monotonic()
 
     try:
         vr_input = build_input(args)
@@ -897,34 +632,17 @@ def main() -> int:
                 if elapsed < interval_s:
                     time.sleep(interval_s - elapsed)
         else:
-            if isinstance(vr_input, RealSenseHandInput):
-                vr_input.start()
-                print(
-                    "D455 hand teleop ready. Show your right hand to the camera. "
-                    "Waiting for hand landmarks...",
-                    flush=True,
-                )
-                if vr_input.preview is not None:
-                    print(f"Camera preview: {vr_input.preview.url}", flush=True)
-            else:
-                print(
-                    f"VR teleop ready. Listening for Quest 3 UDP on 0.0.0.0:{vr_input.port}. "
-                    "Waiting for valid hand frames...",
-                    flush=True,
-                )
+            print(
+                f"VR teleop ready. Listening for Quest 3 UDP on 0.0.0.0:{vr_input.port}. "
+                "Waiting for valid hand frames...",
+                flush=True,
+            )
             while True:
                 started = time.time()
                 frame = vr_input.poll()
                 if frame is not None:
                     last_frame_time = time.monotonic()
                     action = teleop.step(frame)
-                    if args.print_curls and time.monotonic() - last_curls_time >= 0.5:
-                        print(
-                            "curls=" + json.dumps(frame.finger_curls, sort_keys=True)
-                            + " targets=" + json.dumps(action, sort_keys=True),
-                            flush=True,
-                        )
-                        last_curls_time = time.monotonic()
                 elif time.monotonic() - last_frame_time > 0.25:
                     teleop.step(
                         VRFrame(
@@ -935,22 +653,13 @@ def main() -> int:
                         )
                     )
                 if time.monotonic() - last_status_time >= 2.0:
-                    if isinstance(vr_input, RealSenseHandInput):
-                        print(
-                            "D455 status: "
-                            f"frames={vr_input.received_frames} "
-                            f"valid_hand={vr_input.valid_frames} "
-                            f"no_hand={vr_input.no_hand_frames}",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            "Quest 3 status: "
-                            f"packets={vr_input.received_packets} "
-                            f"valid={vr_input.valid_frames} "
-                            f"invalid={vr_input.invalid_packets}",
-                            flush=True,
-                        )
+                    print(
+                        "Quest 3 status: "
+                        f"packets={vr_input.received_packets} "
+                        f"valid={vr_input.valid_frames} "
+                        f"invalid={vr_input.invalid_packets}",
+                        flush=True,
+                    )
                     last_status_time = time.monotonic()
                 elapsed = time.time() - started
                 if elapsed < interval_s:

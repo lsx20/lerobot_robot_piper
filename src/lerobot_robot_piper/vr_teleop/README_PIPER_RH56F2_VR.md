@@ -58,79 +58,61 @@ python3 -m lerobot_robot_piper.vr_teleop.piper_rh56f2_vr_teleop \
 }
 ```
 
-## D455 Hand-Only Teleoperation
+## Quest 3 VR Input
 
-The D455 can now be used instead of Quest 3 for the first phase. The input
-module reads a color frame, runs the existing `gesture_recognizer.task` hand
-model, flattens the 21 landmarks into 63 numbers, computes normalized finger
-curls, and creates the same `VRFrame` used by the Quest 3 path.
+This follows the first `vr_teleop` project's input path. The Quest 3 Hand
+Tracking Streamer app sends the right wrist pose and 21 right-hand landmarks
+to the computer as a UDP text packet. The computer listens on UDP port 9000.
 
 The data path is:
 
 ```text
-D455 color image -> MediaPipe landmarks -> finger_curls -> VRFrame
+Quest 3 Hand Tracking Streamer -> UDP:9000 -> VRFrame
     -> RH56F2SimpleRetargeter -> hand.<finger>.pos -> /dev/ttyUSB0
 ```
 
-Install the RealSense Python binding in the same environment used to run the
-teleop command:
-
-```bash
-python3 -m pip install pyrealsense2
-```
-
-First run a dry-run. It opens the D455 but does not connect to hardware and
-prints the generated RH56F2 actions. With `--show-camera`, open the printed
-browser URL, normally `http://127.0.0.1:8765/`, to view the live annotated
-stream:
+Configure the Quest 3 app with the computer's LAN IP address, not
+`127.0.0.1`, and port `9000`. The Quest 3 and computer must be on the same
+LAN. Start the listener without hardware first:
 
 ```bash
 PYTHONPATH=/home/zhiyu/robot_ws/lerobot_robot_piper/src \
 python3 -u -m lerobot_robot_piper.vr_teleop.piper_rh56f2_vr_teleop \
-  --input-source realsense \
-  --show-camera
-```
-
-The browser preview is used instead of an OpenCV window because MediaPipe's
-EGL context can block Qt/OpenCV GUI calls on some desktop environments.
-
-For the first real test, connect only the hand. Keep the Piper arm disabled:
-
-```bash
-PYTHONPATH=/home/zhiyu/robot_ws/lerobot_robot_piper/src \
-python3 -u -m lerobot_robot_piper.vr_teleop.piper_rh56f2_vr_teleop \
-  --input-source realsense \
-  --show-camera \
-  --connect --hand-only \
-  --hand-port /dev/ttyUSB0 \
-  --hand-speed 300 \
-  --max-hand-delta 30 \
-  --thumb-swing-closed 500
-```
-
-Removing the hand from the camera causes the deadman state to become false
-and stops new motion commands. Press `Ctrl-C` to stop. This phase uses the
-image-normalized wrist coordinates only as a placeholder; they are ignored by
-`HandOnlyRobot` and are not yet used to move Piper.
-
-## Next Step
-
-The simple curl mapping is only the first hardware validation layer. The
-upstream Quest 3 UDP format is now accepted directly with `--input-source
-quest3`. After the arm and hand follow safely, replace
-`RH56F2SimpleRetargeter` with an AnyDexRetarget-backed retargeter that converts
-full hand landmarks into RH56F2 joint targets.
-
-Quest 3 input:
-
-```bash
-python3 -m lerobot_robot_piper.vr_teleop.piper_rh56f2_vr_teleop \
   --input-source quest3 --port 9000
 ```
 
-The command above is dry-run by default. Add `--connect` only after the input
-and mapping have been checked. The first real-hardware test should use low
-`--speed`, `--max-ee-delta-mm`, and `--max-hand-delta` values.
+Check that the computer is listening:
+
+```bash
+ss -lunp | rg ':9000'
+```
+
+The status line should show packets increasing after the app starts streaming.
+For the first real test, connect only RH56F2 and keep Piper disabled:
+
+```bash
+PYTHONPATH=/home/zhiyu/robot_ws/lerobot_robot_piper/src \
+python3 -u -m lerobot_robot_piper.vr_teleop.piper_rh56f2_vr_teleop \
+  --input-source quest3 \
+  --port 9000 \
+  --connect --hand-only \
+  --hand-port /dev/ttyUSB0 \
+  --hand-speed 1000 \
+  --max-hand-delta 80 \
+  --thumb-swing-closed 500
+```
+
+The command above uses the Quest 3 wrist position for the future Piper arm
+mapping and sends only the hand channels when `--hand-only` is enabled.
+Removing the hand from the Quest 3 stream makes the deadman state false and
+stops new motion commands. Press `Ctrl-C` to stop.
+
+## Next Step
+
+The current simple mapper is kept only as the hardware interface baseline.
+The next upgrade is to pass the same 63 Quest 3 landmark values through
+AnyDexRetarget, then adapt its modeled-hand output to RH56F2's six serial
+channels.
 
 ## AnyDex Mode
 
