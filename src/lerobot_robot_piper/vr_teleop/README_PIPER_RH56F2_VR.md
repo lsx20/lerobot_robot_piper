@@ -107,6 +107,48 @@ mapping and sends only the hand channels when `--hand-only` is enabled.
 Removing the hand from the Quest 3 stream makes the deadman state false and
 stops new motion commands. Press `Ctrl-C` to stop.
 
+## Apple Vision Pro Input
+
+Vision Pro uses the Tracking Streamer app shown in the headset. Its screen
+must show `gRPC Server Ready`. The computer connects to the Vision Pro; the
+Vision Pro IP in the screenshot is `192.168.3.62`.
+
+Install the upstream gRPC client once if needed:
+
+```bash
+python3 -m pip install avp-stream
+```
+
+Start the computer program with the Vision Pro IP:
+
+```bash
+PYTHONPATH=/home/zhiyu/robot_ws/lerobot_robot_piper/src \
+python3 -u -m lerobot_robot_piper.vr_teleop.piper_rh56f2_vr_teleop \
+  --input-source avp \
+  --avp-ip 192.168.3.62
+```
+
+After the computer prints `Vision Pro teleop ready`, press `START` in the
+Vision Pro Tracking Streamer app. The computer should then print increasing
+`Vision Pro status` frame counts.
+
+For a hand-only hardware test:
+
+```bash
+PYTHONPATH=/home/zhiyu/robot_ws/lerobot_robot_piper/src \
+python3 -u -m lerobot_robot_piper.vr_teleop.piper_rh56f2_vr_teleop \
+  --input-source avp \
+  --avp-ip 192.168.3.62 \
+  --connect --hand-only \
+  --hand-port /dev/ttyUSB0 \
+  --hand-speed 1000 \
+  --max-hand-delta 80 \
+  --thumb-swing-closed 500
+```
+
+Vision Pro and the computer must be connected to the same LAN. Do not use
+`127.0.0.1`; that address means the local computer itself.
+
 ## Next Step
 
 The current simple mapper is kept only as the hardware interface baseline.

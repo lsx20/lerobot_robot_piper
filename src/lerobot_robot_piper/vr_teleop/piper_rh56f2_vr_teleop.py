@@ -244,6 +244,68 @@ class Quest3UDPInput:
         )
 
 
+class VisionProInput:
+    """Read Apple Vision Pro Tracking Streamer frames through avp_stream."""
+
+    # Vision Pro exposes a 25-joint hand skeleton. These are the 21 joints
+    # used by the MediaPipe/AnyDex hand convention; metacarpals are skipped.
+    VP_TO_MEDIAPIPE = (
+        0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 24
+    )
+    AVP_TO_ROBOT = np.asarray(
+        [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+    def __init__(self, ip: str):
+        try:
+            from avp_stream import VisionProStreamer
+        except ImportError as exc:
+            raise RuntimeError(
+                "Vision Pro input needs avp-stream. Install it with: "
+                "python3 -m pip install avp-stream"
+            ) from exc
+
+        self.ip = ip
+        self.streamer = VisionProStreamer(ip=ip, record=False)
+        self.received_frames = 0
+        self.valid_frames = 0
+
+    def close(self) -> None:
+        cleanup = getattr(self.streamer, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+
+    def poll(self) -> VRFrame | None:
+        data = self.streamer.get_latest()
+        if data is None or data.right is None:
+            return None
+
+        hand = data.right
+        if hand.shape[0] <= max(self.VP_TO_MEDIAPIPE):
+            return None
+
+        points = np.asarray(
+            [hand[index][:3, 3] for index in self.VP_TO_MEDIAPIPE],
+            dtype=np.float64,
+        )
+        if np.allclose(points, 0.0):
+            return None
+
+        self.received_frames += 1
+        self.valid_frames += 1
+        wrist_avp = np.asarray(hand[0][:3, 3], dtype=np.float64)
+        wrist_robot = self.AVP_TO_ROBOT @ wrist_avp
+        landmarks = points.reshape(-1).tolist()
+        return VRFrame(
+            wrist_xyz_m=tuple(float(value) for value in wrist_robot),
+            wrist_rpy_deg=None,
+            finger_curls=landmarks_to_simple_curls(landmarks),
+            deadman=True,
+            landmarks=[float(value) for value in landmarks],
+        )
+
+
 class ArmPoseMapper:
     """Map relative VR wrist motion to Piper end-effector pose commands."""
 
@@ -544,9 +606,11 @@ def build_robot(args: argparse.Namespace) -> object:
     )
 
 
-def build_input(args: argparse.Namespace) -> Quest3UDPInput | None:
+def build_input(args: argparse.Namespace) -> Quest3UDPInput | VisionProInput | None:
     if args.input_source == "quest3":
         return Quest3UDPInput(args.port)
+    if args.input_source == "avp":
+        return VisionProInput(args.avp_ip)
     return None
 
 
@@ -565,8 +629,9 @@ def build_hand_mapper(args: argparse.Namespace) -> object:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--connect", action="store_true", help="Connect real Piper + RH56F2 hardware.")
-    parser.add_argument("--input-source", choices=["stdin", "quest3"], default="quest3")
+    parser.add_argument("--input-source", choices=["stdin", "quest3", "avp"], default="quest3")
     parser.add_argument("--port", type=int, default=9000, help="Quest 3 UDP input port.")
+    parser.add_argument("--avp-ip", default="192.168.1.100", help="Apple Vision Pro IP address.")
     parser.add_argument("--hand-mode", choices=["simple", "anydex"], default="simple")
     parser.add_argument("--hand-config", type=Path)
     parser.add_argument("--anydex-root", type=Path, default=Path("third_party/AnyDexRetarget"))
@@ -615,7 +680,7 @@ def main() -> int:
     )
     interval_s = 1.0 / args.rate_hz
     print(f"Initializing input source: {args.input_source}", flush=True)
-    vr_input: Quest3UDPInput | None = None
+    vr_input: Quest3UDPInput | VisionProInput | None = None
     last_frame_time = time.monotonic()
     last_status_time = time.monotonic()
 
@@ -632,11 +697,18 @@ def main() -> int:
                 if elapsed < interval_s:
                     time.sleep(interval_s - elapsed)
         else:
-            print(
-                f"VR teleop ready. Listening for Quest 3 UDP on 0.0.0.0:{vr_input.port}. "
-                "Waiting for valid hand frames...",
-                flush=True,
-            )
+            if isinstance(vr_input, Quest3UDPInput):
+                print(
+                    f"VR teleop ready. Listening for Quest 3 UDP on 0.0.0.0:{vr_input.port}. "
+                    "Waiting for valid hand frames...",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Vision Pro teleop ready. Connecting to {vr_input.ip}. "
+                    "Waiting for right-hand frames...",
+                    flush=True,
+                )
             while True:
                 started = time.time()
                 frame = vr_input.poll()
@@ -653,13 +725,21 @@ def main() -> int:
                         )
                     )
                 if time.monotonic() - last_status_time >= 2.0:
-                    print(
-                        "Quest 3 status: "
-                        f"packets={vr_input.received_packets} "
-                        f"valid={vr_input.valid_frames} "
-                        f"invalid={vr_input.invalid_packets}",
-                        flush=True,
-                    )
+                    if isinstance(vr_input, Quest3UDPInput):
+                        print(
+                            "Quest 3 status: "
+                            f"packets={vr_input.received_packets} "
+                            f"valid={vr_input.valid_frames} "
+                            f"invalid={vr_input.invalid_packets}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "Vision Pro status: "
+                            f"frames={vr_input.received_frames} "
+                            f"valid_hand={vr_input.valid_frames}",
+                            flush=True,
+                        )
                     last_status_time = time.monotonic()
                 elapsed = time.time() - started
                 if elapsed < interval_s:
