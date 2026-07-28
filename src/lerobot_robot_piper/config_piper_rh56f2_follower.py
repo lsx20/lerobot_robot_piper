@@ -23,6 +23,7 @@ class PiperRH56F2FollowerConfig(RobotConfig):
     hand_id: int = 1
     hand_speed: int = 800
     hand_force: int = 1500
+    hand_mode: int = 0
     max_hand_delta: float | None = 120.0
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)

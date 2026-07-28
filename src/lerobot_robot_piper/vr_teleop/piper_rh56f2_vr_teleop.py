@@ -400,10 +400,11 @@ def parse_qpos_groups(value: str) -> list[list[int]]:
 class AnyDexRH56F2Retargeter:
     """Use AnyDexRetarget as a hand-pose front end for RH56F2.
 
-    AnyDexRetarget targets a modeled hand, not RH56F2. The configured qpos
-    groups therefore become normalized finger curls before RH56F2 register
-    angles are generated. The groups must be calibrated for the selected
-    AnyDex robot model.
+    AnyDexRetarget targets a modeled hand, not RH56F2. We therefore convert
+    the modeled joint angles into normalized curls before generating RH56F2
+    register targets. Joint names are used instead of hard-coded qpos
+    positions because Inspire's qpos order is not thumb,index,middle,ring,
+    little and includes mimic joints.
     """
 
     def __init__(self, config_path: Path, anydex_root: Path, qpos_groups: str):
@@ -418,11 +419,39 @@ class AnyDexRH56F2Retargeter:
             ) from exc
 
         self.retargeter = Retargeter.from_yaml(str(config_path), "right")
-        self.groups = parse_qpos_groups(qpos_groups)
         lower = np.asarray(self.retargeter.optimizer.opt_lower_bounds, dtype=float)
         upper = np.asarray(self.retargeter.optimizer.opt_upper_bounds, dtype=float)
         self.lower = lower
         self.span = np.maximum(upper - lower, 1e-6)
+
+        joint_names = list(self.retargeter.optimizer.robot.dof_joint_names)
+        self.joint_index = {name: index for index, name in enumerate(joint_names)}
+        required = {
+            "index_proximal_joint",
+            "middle_proximal_joint",
+            "ring_proximal_joint",
+            "pinky_proximal_joint",
+            "thumb_proximal_yaw_joint",
+            "thumb_proximal_pitch_joint",
+        }
+        missing = sorted(required - self.joint_index.keys())
+        if missing:
+            raise ValueError(
+                "AnyDex hand model is missing the joints needed for RH56F2: "
+                + ", ".join(missing)
+            )
+
+        # This is the physical RH56F2 order, not the AnyDex qpos order.
+        self.channel_joint = {
+            "index": "index_proximal_joint",
+            "middle": "middle_proximal_joint",
+            "ring": "ring_proximal_joint",
+            "little": "pinky_proximal_joint",
+            "thumb_swing": "thumb_proximal_yaw_joint",
+            "thumb_bend": "thumb_proximal_pitch_joint",
+        }
+        self.register_mapper = RH56F2SimpleRetargeter()
+        self._last_debug_time = 0.0
 
     def map_landmarks(self, landmarks: list[float]) -> dict[str, float]:
         if len(landmarks) != 63:
@@ -432,14 +461,22 @@ class AnyDexRH56F2Retargeter:
             dtype=float,
         )
         curls: dict[str, float] = {}
-        names = ["thumb_bend", "index", "middle", "ring", "little"]
-        for name, group in zip(names, self.groups, strict=True):
-            if any(index >= len(qpos) for index in group):
-                raise ValueError(f"AnyDex qpos group {group} exceeds output size {len(qpos)}")
-            normalized = [(qpos[index] - self.lower[index]) / self.span[index] for index in group]
-            curls[name] = float(np.clip(np.mean(normalized), 0.0, 1.0))
-        curls["thumb_swing"] = 0.0
-        return RH56F2SimpleRetargeter().map(curls)
+        for channel, joint_name in self.channel_joint.items():
+            index = self.joint_index[joint_name]
+            curls[channel] = float(
+                np.clip((qpos[index] - self.lower[index]) / self.span[index], 0.0, 1.0)
+            )
+
+        # The old adapter forced this channel to zero, which made thumb
+        # abduction/adduction invisible to the real hand.
+        if time.monotonic() - self._last_debug_time >= 0.5:
+            print(
+                "AnyDex curls: "
+                + json.dumps({name: round(value, 3) for name, value in curls.items()}, sort_keys=True),
+                flush=True,
+            )
+            self._last_debug_time = time.monotonic()
+        return self.register_mapper.map(curls)
 
 
 class DryRunRobot:

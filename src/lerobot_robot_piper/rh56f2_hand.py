@@ -53,6 +53,7 @@ class RH56F2HandConfig:
     hand_id: int = 1
     speed: int = 800
     force: int = 1500
+    mode: int = 0
 
 
 def _checksum(frame: list[int]) -> int:
@@ -90,6 +91,7 @@ class RH56F2Hand:
     def __init__(self, config: RH56F2HandConfig):
         self.config = config
         self.ser: serial.Serial | None = None
+        self.last_write_ack: int | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -100,7 +102,7 @@ class RH56F2Hand:
         self.configure()
 
     def configure(self) -> None:
-        self.write_positions("mode", {name: 0 for name in HAND_NAMES})
+        self.write_positions("mode", {name: self.config.mode for name in HAND_NAMES})
         self.write_positions("speedSet", {name: self.config.speed for name in HAND_NAMES})
         self.write_positions("forceSet", {name: self.config.force for name in HAND_NAMES})
 
@@ -117,7 +119,9 @@ class RH56F2Hand:
         frame.append(_checksum(frame))
         self.ser.write(bytes(frame))
         time.sleep(0.02)
-        return self.ser.read_all()
+        response = self.ser.read_all()
+        self.last_write_ack = response[7] if len(response) > 7 else None
+        return response
 
     def _read_register(self, address: int, length: int) -> list[int]:
         if self.ser is None:
@@ -147,7 +151,7 @@ class RH56F2Hand:
             raise RuntimeError(f"No RH56F2 response while reading {key}")
         return {name: float(value) for name, value in zip(HAND_NAMES, values, strict=True)}
 
-    def write_positions(self, key: str, values_by_name: dict[str, float]) -> None:
+    def write_positions(self, key: str, values_by_name: dict[str, float]) -> bool:
         current = {name: 0.0 for name in HAND_NAMES}
         if key == "angleSet":
             try:
@@ -162,7 +166,7 @@ class RH56F2Hand:
                 value = min(max(float(value), lo), hi)
             values.append(int(round(value)))
         self._write_register(REG[key], _pack_six(values))
+        return self.last_write_ack == 0x01
 
-    def set_angles(self, values_by_name: dict[str, float]) -> None:
-        self.write_positions("angleSet", values_by_name)
-
+    def set_angles(self, values_by_name: dict[str, float]) -> bool:
+        return self.write_positions("angleSet", values_by_name)

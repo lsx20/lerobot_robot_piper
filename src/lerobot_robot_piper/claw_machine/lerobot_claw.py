@@ -1,32 +1,93 @@
 #!/usr/bin/env python3
-"""LeRobot-style claw-machine controller for Piper + RH56F2.
+"""Complete LeRobot-style claw-machine controller for Piper + RH56F2.
 
-This module is the bridge from the older direct-SDK claw scripts to LeRobot's
-Robot interface. It only talks to the robot through:
+This is the LeRobot equivalent of the direct-SDK claw_machine workflow:
+
+  setup MOVE_J -> keyboard/gamepad MOVE_J teleop -> pick/drop MOVE_P cycle
+  -> force-based held check -> result gesture -> back to teleop.
+
+The controller talks to hardware through the LeRobot Robot surface:
 
   - robot.get_observation()
-  - robot.send_action(...)
-
-That makes the claw workflow look like a hand-written policy on top of a
-LeRobot-compatible robot.
+  - robot.send_action(action)
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import select
+import struct
+import sys
+import termios
+import threading
 import time
+import tty
+from copy import copy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 from lerobot.processor import RobotAction, RobotObservation
 
-from ..config_piper_rh56f2_follower import PiperRH56F2FollowerConfig
-from ..piper_rh56f2_follower import EE_POSE_NAMES, PiperRH56F2Follower
-from .claw_hand_grasp import BALL_CLOSED, BALL_READY_OPEN
+try:
+    from ..config_piper_rh56f2_follower import PiperRH56F2FollowerConfig
+    from ..piper_follower import JOINT_LIMITS_DEG, JOINT_NAMES
+    from ..piper_rh56f2_follower import EE_POSE_NAMES, PiperRH56F2Follower
+    from ..rh56f2_hand import DEFAULT_CLOSED, DEFAULT_OPEN, HAND_NAMES
+except ImportError:  # Allow running from this directory with: python lerobot_claw.py
+    package_parent = Path(__file__).resolve().parents[2]
+    if str(package_parent) not in sys.path:
+        sys.path.insert(0, str(package_parent))
+    from lerobot_robot_piper.config_piper_rh56f2_follower import PiperRH56F2FollowerConfig
+    from lerobot_robot_piper.piper_follower import JOINT_LIMITS_DEG, JOINT_NAMES
+    from lerobot_robot_piper.piper_rh56f2_follower import EE_POSE_NAMES, PiperRH56F2Follower
+    from lerobot_robot_piper.rh56f2_hand import DEFAULT_CLOSED, DEFAULT_OPEN, HAND_NAMES
+
+
+JS_EVENT_FORMAT = "IhBB"
+JS_EVENT_SIZE = struct.calcsize(JS_EVENT_FORMAT)
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+
+DEFAULT_START_POSE = [282.857, -2.963, 364.752, 172.794, 54.610, 171.120]
+DEFAULT_START_JOINTS = [-0.807, 71.692, -65.543, 1.088, 33.928, 3.761]
+JOINT_KEYS = [f"{name}.pos" for name in JOINT_NAMES]
+
+BALL_READY_OPEN = dict(DEFAULT_OPEN)
+BALL_READY_OPEN.update(
+    {
+        "little": 1800,
+        "ring": 1800,
+        "middle": 1800,
+        "index": 1800,
+        "thumb_bend": 1500,
+        "thumb_swing": 1050,
+    }
+)
+
+BALL_CLOSED = dict(DEFAULT_CLOSED)
+BALL_CLOSED.update(
+    {
+        "little": 1200,
+        "ring": 1220,
+        "middle": 1350,
+        "index": 1350,
+        "thumb_bend": 1350,
+        "thumb_swing": 1050,
+    }
+)
+
+THUMB_GESTURE = dict(DEFAULT_CLOSED)
+THUMB_GESTURE.update({"thumb_bend": 1500, "thumb_swing": 1800})
+
+GRASP_HAND_SPEED = 800
+GRASP_HAND_FORCE = 600
 
 
 class ActionRobot(Protocol):
-    """Small part of LeRobot's Robot API needed by this controller."""
+    """Small LeRobot Robot surface used by this controller."""
 
     def get_observation(self) -> RobotObservation:
         ...
@@ -35,46 +96,189 @@ class ActionRobot(Protocol):
         ...
 
 
+class RawTerminal:
+    def __enter__(self) -> "RawTerminal":
+        self.fd = sys.stdin.fileno()
+        self.old_settings = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+
+
+class LinuxJoystick:
+    """Small reader for /dev/input/js* devices."""
+
+    def __init__(self, device: str):
+        self.device = device
+        self.fd: int | None = None
+        self.axes: dict[int, float] = {}
+        self.button_presses: set[int] = set()
+
+    def __enter__(self) -> "LinuxJoystick":
+        self.fd = os.open(self.device, os.O_RDONLY | os.O_NONBLOCK)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def read_events(self) -> None:
+        if self.fd is None:
+            raise RuntimeError("joystick is not open")
+        while select.select([self.fd], [], [], 0.0)[0]:
+            try:
+                data = os.read(self.fd, JS_EVENT_SIZE)
+            except BlockingIOError:
+                return
+            if len(data) != JS_EVENT_SIZE:
+                return
+
+            _, value, event_type, number = struct.unpack(JS_EVENT_FORMAT, data)
+            if event_type & JS_EVENT_INIT:
+                continue
+            event_type &= ~JS_EVENT_INIT
+            if event_type == JS_EVENT_AXIS:
+                self.axes[number] = max(-1.0, min(1.0, value / 32767.0))
+            elif event_type == JS_EVENT_BUTTON and value == 1:
+                self.button_presses.add(number)
+
+    def discard_events(self) -> None:
+        if self.fd is None:
+            raise RuntimeError("joystick is not open")
+        while select.select([self.fd], [], [], 0.0)[0]:
+            try:
+                data = os.read(self.fd, JS_EVENT_SIZE)
+            except BlockingIOError:
+                break
+            if len(data) != JS_EVENT_SIZE:
+                break
+        self.axes.clear()
+        self.button_presses.clear()
+
+    def axis(self, number: int, deadzone: float) -> float:
+        value = self.axes.get(number, 0.0)
+        if abs(value) < deadzone:
+            return 0.0
+        sign = 1.0 if value > 0.0 else -1.0
+        return sign * ((abs(value) - deadzone) / (1.0 - deadzone))
+
+    def pop_button(self, number: int) -> bool:
+        if number not in self.button_presses:
+            return False
+        self.button_presses.remove(number)
+        return True
+
+
+class GamepadStopMonitor:
+    """Monitor button 1 without consuming the teleop joystick stream."""
+
+    def __init__(self, device: str, on_stop: callable) -> None:
+        self.device = device
+        self.on_stop = on_stop
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        try:
+            with LinuxJoystick(self.device) as joystick:
+                while not self.stop_event.is_set():
+                    joystick.read_events()
+                    if joystick.pop_button(1):
+                        self.on_stop()
+                        return
+                    joystick.discard_events()
+                    self.stop_event.wait(0.01)
+        except OSError as exc:
+            print(f"\n[warn] B stop monitor unavailable: {exc}")
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+
+
 @dataclass
 class ClawMachineTaskConfig:
-    """Task-level parameters for one claw-machine pick/drop cycle.
-
-    Units match ``PiperRH56F2Follower``:
-      - end-effector x/y/z are millimeters
-      - end-effector rx/ry/rz are degrees
-      - RH56F2 hand values are vendor register angle units
-    """
+    """Task parameters, using LeRobot action/observation units."""
 
     grab_z: float
-    drop_pose: dict[str, float]
-    start_pose: dict[str, float] | None = None
+    drop_pose: dict[str, float] | None = None
+    start_pose: dict[str, float] = field(default_factory=lambda: pose_from_values(DEFAULT_START_POSE))
+    start_joints: list[float] = field(default_factory=lambda: list(DEFAULT_START_JOINTS))
     lift_z: float | None = None
-    speed_rate: int = 30
-    rate_hz: float = 10.0
-    start_duration_s: float = 6.0
+    speed_rate: int = 8
+    rate_hz: float = 40.0
+    feedback_timeout_s: float = 8.0
+    start_duration_s: float = 8.0
+    hover_z: float | None = None
+    hover_duration_s: float = 6.0
     vertical_duration_s: float = 4.0
     transfer_duration_s: float = 8.0
     return_duration_s: float = 8.0
+    auto_position_tolerance_mm: float = 2.0
+    auto_rpy_tolerance_deg: float = 2.0
+    j1_step_deg: float = 2.0
+    reach_step_deg: float = 2.0
+    reach_transition_j2_deg: float = 90.0
+    reach_pre_j2_gain: float = 1.0
+    reach_pre_j3_gain: float = -0.85
+    reach_pre_j5_gain: float = -0.05
+    reach_post_j2_gain: float = 1.0
+    reach_post_j3_gain: float = -1.2
+    reach_post_j5_gain: float = -0.15
+    hand_speed: int = 800
+    pre_grab_open_speed: int = 1800
+    adaptive_close_force_threshold: float = 300.0
+    adaptive_close_step_deg: float = 25.0
+    adaptive_close_rear_step_deg: float = 35.0
+    adaptive_close_settle_s: float = 0.05
+    grasp_mode: int = 0
     hand_settle_s: float = 1.0
-    pre_grab_open_settle_s: float = 0.5
-    drop_open_settle_s: float = 1.0
-    held_force_threshold: float = 130.0
+    pre_grab_open_settle_s: float = 1.0
+    drop_open_settle_s: float = 4.0
+    held_force_threshold: float = 100.0
     held_force_fingers: list[str] = field(
-        default_factory=lambda: ["thumb_bend", "thumb_swing", "index", "middle"]
+        default_factory=lambda: list(HAND_NAMES)
     )
-    held_required_samples: int = 3
-    held_check_duration_s: float = 1.0
+    held_force_alt_fingers: list[str] = field(default_factory=list)
+    held_force_count: int = 2
+    held_required_samples: int = 15
+    held_check_duration_s: float = 2.5
     held_check_rate_hz: float = 5.0
+    result_gesture: bool = True
+    result_gesture_speed: int = 20
+    result_gesture_j2_back_deg: float = 30.0
+    result_gesture_j6_deg: float = 90.0
+    result_thumb_speed: int = 2500
+    result_thumb_settle_s: float = 0.8
+    result_gesture_duration_s: float = 6.0
+    result_gesture_hold_after_s: float = 2.0
+    result_gesture_return_duration_s: float = 2.5
+    control: str = "keyboard"
+    gamepad_device: str = "/dev/input/js0"
+    gamepad_deadzone: float = 0.18
+    gamepad_axis_x: int = 0
+    gamepad_axis_y: int = 1
+    gamepad_invert_y: bool = True
+    gamepad_j1_speed_dps: float = 8.0
+    gamepad_reach_speed_dps: float = 6.0
+    gamepad_axis_curve: float = 1.8
+    gamepad_print_interval: float = 0.2
+    gamepad_lead_limit_deg: float = 1.5
+    gamepad_stop_reset: bool = True
 
 
-def pose_from_raw(raw_pose: list[int]) -> dict[str, float]:
-    """Convert Piper SDK raw 0.001 mm/deg pose into LeRobot ee action keys."""
-    if len(raw_pose) != 6:
-        raise ValueError("expected 6 raw pose values: X,Y,Z,RX,RY,RZ")
-    return {
-        name: value / 1000.0
-        for name, value in zip(EE_POSE_NAMES, raw_pose, strict=True)
-    }
+def pose_from_values(values: list[float]) -> dict[str, float]:
+    if len(values) != 6:
+        raise ValueError("expected 6 pose values: X,Y,Z,RX,RY,RZ")
+    return dict(zip(EE_POSE_NAMES, values, strict=True))
 
 
 def parse_pose_mm_deg(value: str) -> dict[str, float]:
@@ -85,92 +289,1131 @@ def parse_pose_mm_deg(value: str) -> dict[str, float]:
         values = [float(part) for part in parts]
     except ValueError as exc:
         raise argparse.ArgumentTypeError("pose values must be numbers") from exc
-    return dict(zip(EE_POSE_NAMES, values, strict=True))
+    return pose_from_values(values)
 
 
-def ee_pose_from_observation(obs: RobotObservation) -> dict[str, float]:
-    return {name: float(obs[name]) for name in EE_POSE_NAMES}
+def parse_joint_degrees(value: str) -> list[float]:
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 6:
+        raise argparse.ArgumentTypeError("expected J1,J2,J3,J4,J5,J6")
+    try:
+        values = [float(part) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("joint values must be numbers") from exc
+    if not joint_limits_ok(values):
+        raise argparse.ArgumentTypeError("joint target is outside Piper limits")
+    return values
+
+
+def parse_name_list(value: str) -> list[str]:
+    names = [part.strip() for part in value.split(",") if part.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError("expected comma-separated names")
+    return names
+
+
+def read_key(timeout_s: float = 0.1) -> str | None:
+    ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
+    if not ready:
+        return None
+    key = sys.stdin.read(1)
+    while select.select([sys.stdin], [], [], 0.0)[0]:
+        key = sys.stdin.read(1)
+    return key
+
+
+def shaped_axis(value: float, curve: float) -> float:
+    if value == 0.0:
+        return 0.0
+    sign = 1.0 if value > 0.0 else -1.0
+    return sign * (abs(value) ** curve)
+
+
+def joint_limits_ok(joints: list[float]) -> bool:
+    return all(
+        lo <= value <= hi
+        for value, (lo, hi) in zip(joints, JOINT_LIMITS_DEG.values(), strict=True)
+    )
+
+
+def fmt_joints(values: list[float]) -> str:
+    return " ".join(f"{value:8.3f}" for value in values)
+
+
+def key_to_joint_move(key: str) -> tuple[str, int] | None:
+    key = key.lower()
+    if key == "w":
+        return "forward", 0
+    if key == "s":
+        return "back", 1
+    if key == "d":
+        return "right", 2
+    if key == "a":
+        return "left", 3
+    return None
+
+
+def apply_joint_step(
+    target: list[float],
+    direction: int,
+    config: ClawMachineTaskConfig,
+    locked_j4: float,
+    locked_j5: float,
+    locked_j6: float,
+) -> tuple[list[float], str]:
+    def apply_reach_gains(
+        joints: list[float],
+        signed_step: float,
+        gains: tuple[float, float, float],
+    ) -> None:
+        joints[1] += signed_step * gains[0]
+        joints[2] += signed_step * gains[1]
+        joints[4] += signed_step * gains[2]
+
+    def apply_reach(joints: list[float], sign: float) -> str:
+        j2 = joints[1]
+        reach_step = config.reach_step_deg
+        transition = config.reach_transition_j2_deg
+        pre_gains = (
+            config.reach_pre_j2_gain,
+            config.reach_pre_j3_gain,
+            config.reach_pre_j5_gain,
+        )
+        post_gains = (
+            config.reach_post_j2_gain,
+            config.reach_post_j3_gain,
+            config.reach_post_j5_gain,
+        )
+
+        label = "pre"
+        if sign > 0:
+            if j2 < transition:
+                pre_j2_delta = min(reach_step * pre_gains[0], transition - j2)
+                if pre_j2_delta > 0:
+                    pre_step = pre_j2_delta / pre_gains[0]
+                    apply_reach_gains(joints, pre_step, pre_gains)
+                remaining = reach_step - max(0.0, pre_j2_delta / pre_gains[0])
+                if remaining > 1e-6:
+                    apply_reach_gains(joints, remaining, post_gains)
+                    label = "pre->post"
+            else:
+                apply_reach_gains(joints, reach_step, post_gains)
+                label = "post"
+        else:
+            if j2 > transition:
+                post_j2_delta = min(reach_step * post_gains[0], j2 - transition)
+                if post_j2_delta > 0:
+                    post_step = post_j2_delta / post_gains[0]
+                    apply_reach_gains(joints, -post_step, post_gains)
+                remaining = reach_step - max(0.0, post_j2_delta / post_gains[0])
+                if remaining > 1e-6:
+                    apply_reach_gains(joints, -remaining, pre_gains)
+                    label = "post->pre"
+                else:
+                    label = "post"
+            else:
+                apply_reach_gains(joints, -reach_step, pre_gains)
+                label = "pre"
+        return label
+
+    next_target = list(target)
+    if direction == 0:
+        phase = apply_reach(next_target, 1.0)
+    elif direction == 1:
+        phase = apply_reach(next_target, -1.0)
+        next_target[4] = locked_j5
+    elif direction == 2:
+        next_target[0] += config.j1_step_deg
+        phase = "base"
+    elif direction == 3:
+        next_target[0] -= config.j1_step_deg
+        phase = "base"
+    else:
+        raise ValueError(f"bad direction: {direction}")
+
+    next_target[3] = locked_j4
+    next_target[5] = locked_j6
+    return next_target, phase
+
+
+def velocity_config(
+    config: ClawMachineTaskConfig,
+    dt_s: float,
+    j1_axis: float = 0.0,
+    reach_axis: float = 0.0,
+) -> ClawMachineTaskConfig:
+    local_config = copy(config)
+    local_config.j1_step_deg = config.gamepad_j1_speed_dps * dt_s * abs(j1_axis)
+    local_config.reach_step_deg = config.gamepad_reach_speed_dps * dt_s * abs(reach_axis)
+    return local_config
+
+
+def clamp_target_lead(target: list[float], actual: list[float], max_lead_deg: float) -> list[float]:
+    if max_lead_deg <= 0.0:
+        return target
+    limited = list(target)
+    for idx, actual_value in enumerate(actual):
+        limited[idx] = min(
+            max(limited[idx], actual_value - max_lead_deg),
+            actual_value + max_lead_deg,
+        )
+    return limited
+
+
+def restore_locked_wrist(target: list[float], locked_j4: float, locked_j6: float) -> list[float]:
+    locked = list(target)
+    locked[3] = locked_j4
+    locked[5] = locked_j6
+    return locked
 
 
 class ClawMachineController:
     def __init__(self, robot: ActionRobot, config: ClawMachineTaskConfig):
         self.robot = robot
         self.config = config
+        self._emergency_stop = threading.Event()
+        self._close_peak_active_count = 0
+        self._close_peak_names: set[str] = set()
 
-    def set_hand_pose(self, pose: dict[str, float]) -> None:
-        action = {f"hand.{name}.pos": value for name, value in pose.items()}
+    def request_emergency_stop(self) -> None:
+        if not self._emergency_stop.is_set():
+            self._emergency_stop.set()
+            print("\n[B] Emergency stop requested: holding current position.")
+
+    def emergency_stop_requested(self) -> bool:
+        return self._emergency_stop.is_set()
+
+    def wait_with_stop(self, duration_s: float) -> bool:
+        return not self._emergency_stop.wait(max(duration_s, 0.0))
+
+    def hold_current_position(self) -> None:
+        try:
+            current = self.current_joints()
+            if self.send_joint_once(current):
+                print(f"Emergency stop: holding current joints {fmt_joints(current)}")
+        except Exception as exc:
+            print(f"[warn] emergency hold failed: {exc}")
+
+    def observation(self) -> RobotObservation:
+        return self.robot.get_observation()
+
+    def current_pose(self) -> dict[str, float]:
+        obs = self.observation()
+        return {name: float(obs[name]) for name in EE_POSE_NAMES}
+
+    def current_joints(self) -> list[float]:
+        obs = self.observation()
+        return [float(obs[key]) for key in JOINT_KEYS]
+
+    def joint_action(self, joints: list[float], speed: int | None = None) -> RobotAction:
+        action: RobotAction = {key: value for key, value in zip(JOINT_KEYS, joints, strict=True)}
+        action["arm.speed_rate"] = float(self.config.speed_rate if speed is None else speed)
+        return action
+
+    def ee_action(self, pose: dict[str, float], speed: int | None = None) -> RobotAction:
+        action: RobotAction = dict(pose)
+        action["arm.speed_rate"] = float(self.config.speed_rate if speed is None else speed)
+        return action
+
+    def hand_pose_action(self, pose: dict[str, float]) -> RobotAction:
+        return {f"hand.{name}.pos": value for name, value in pose.items()}
+
+    def set_hand_pose(self, pose: dict[str, float], label: str) -> bool:
+        self.robot.send_action(self.hand_pose_action(pose))
+        print(f"{label}: hand command sent")
+        return True
+
+    def set_hand_speed(self, speed: int | None, label: str) -> bool:
+        if speed is None:
+            return True
+        action = {f"hand.{name}.speed": float(speed) for name in HAND_NAMES}
         self.robot.send_action(action)
+        print(f"{label}: hand speed set to {speed}")
+        return True
 
-    def move_ee_for(self, pose: dict[str, float], duration_s: float, label: str) -> None:
+    def set_hand_force(self, force: int | None, label: str) -> bool:
+        if force is None:
+            return True
+        action = {f"hand.{name}.force_limit": float(force) for name in HAND_NAMES}
+        self.robot.send_action(action)
+        print(f"{label}: hand force set to {force}")
+        return True
+
+    def set_hand_mode(self, mode: int) -> None:
+        self.robot.send_action({"hand.mode": float(mode)})
+        print(f"grasp mode: {mode}")
+
+    def send_joint_once(self, target: list[float], speed: int | None = None) -> bool:
+        if not joint_limits_ok(target):
+            print(f"\n[warn] MOVE_J target outside limits: {fmt_joints(target)}")
+            return False
+        self.robot.send_action(self.joint_action(target, speed))
+        return True
+
+    def move_joints_for(
+        self,
+        target: list[float],
+        speed: int,
+        duration_s: float,
+        label: str,
+    ) -> bool:
+        deadline = time.time() + duration_s
+        interval_s = 1.0 / self.config.rate_hz
+        while time.time() < deadline:
+            if self.emergency_stop_requested():
+                self.hold_current_position()
+                return False
+            if not self.send_joint_once(target, speed):
+                return False
+            if not self.wait_with_stop(interval_s):
+                self.hold_current_position()
+                return False
+        print(f"{label}: joints {fmt_joints(target)}")
+        return True
+
+    def pose_error_mm_deg(
+        self,
+        actual: dict[str, float],
+        target: dict[str, float],
+    ) -> tuple[float, float]:
+        xyz_error = max(abs(actual[name] - target[name]) for name in EE_POSE_NAMES[:3])
+        rpy_error = max(abs(actual[name] - target[name]) for name in EE_POSE_NAMES[3:])
+        return xyz_error, rpy_error
+
+    def move_ee_for(
+        self,
+        pose: dict[str, float],
+        duration_s: float,
+        label: str,
+        require_reached: bool = False,
+    ) -> bool:
         interval_s = 1.0 / self.config.rate_hz
         deadline = time.time() + duration_s
+        count = 0
         while time.time() < deadline:
-            self.robot.send_action(pose)
-            time.sleep(interval_s)
-        print(f"{label}: {self.format_pose(pose)}")
+            if self.emergency_stop_requested():
+                self.hold_current_position()
+                return False
+            self.robot.send_action(self.ee_action(pose))
+            if not self.wait_with_stop(interval_s):
+                self.hold_current_position()
+                return False
+
+            if count % max(1, int(self.config.rate_hz / 2)) == 0:
+                actual = self.current_pose()
+                xyz_error, rpy_error = self.pose_error_mm_deg(actual, pose)
+                print(
+                    f"\r{label}: xyz_err={xyz_error:.3f}mm "
+                    f"rpy_err={rpy_error:.3f}deg pose=[{self.format_pose(actual)}]",
+                    end="",
+                    flush=True,
+                )
+                if (
+                    xyz_error <= self.config.auto_position_tolerance_mm
+                    and rpy_error <= self.config.auto_rpy_tolerance_deg
+                ):
+                    print()
+                    return True
+            count += 1
+
+        actual = self.current_pose()
+        xyz_error, rpy_error = self.pose_error_mm_deg(actual, pose)
+        reached = (
+            xyz_error <= self.config.auto_position_tolerance_mm
+            and rpy_error <= self.config.auto_rpy_tolerance_deg
+        )
+        state = "done" if reached or not require_reached else "timeout"
+        print(
+            f"{label} {state}: xyz_err={xyz_error:.3f}mm rpy_err={rpy_error:.3f}deg "
+            f"pose=[{self.format_pose(actual)}]"
+        )
+        return reached or not require_reached
 
     def held_by_force(self) -> bool:
-        deadline = time.time() + self.config.held_check_duration_s
+        required_duration_s = self.config.held_check_duration_s
         interval_s = 1.0 / self.config.held_check_rate_hz
-        consecutive = 0
-        best = 0
+        check_started = time.monotonic()
+        # The required duration is measured from the first qualifying sample.
+        # Leave enough total time for pressure to become stable after lifting.
+        deadline = check_started + max(required_duration_s * 2.0, required_duration_s + 1.0)
+        active_since: float | None = None
+        active_samples = 0
+        best_duration_s = 0.0
+        best_samples = 0
+        tracked_names = sorted(
+            set(self.config.held_force_fingers) | set(self.config.held_force_alt_fingers)
+        )
+        last_active = {name: 0.0 for name in tracked_names}
+        best_group = ""
 
-        while time.time() < deadline:
-            obs = self.robot.get_observation()
-            active = [
-                abs(float(obs.get(f"hand.{name}.force", 0.0)))
-                >= self.config.held_force_threshold
-                for name in self.config.held_force_fingers
+        def qualifies(active_names: list[str]) -> bool:
+            thumb_active = any(
+                name in {"thumb_bend", "thumb_swing"} for name in active_names
+            )
+            return (
+                len(active_names) >= self.config.held_force_count
+                and thumb_active
+                and self._close_peak_active_count >= 3
+            )
+
+        while time.monotonic() < deadline:
+            if self.emergency_stop_requested():
+                self.hold_current_position()
+                return False
+            obs = self.observation()
+            sample_time = time.monotonic()
+            last_active = {
+                name: abs(float(obs.get(f"hand.{name}.force", 0.0)))
+                for name in tracked_names
+            }
+            active_names = [
+                name
+                for name in tracked_names
+                if last_active.get(name, 0.0) >= self.config.held_force_threshold
             ]
-            if all(active):
-                consecutive += 1
-                best = max(best, consecutive)
+            thumb_active = any(
+                name in {"thumb_bend", "thumb_swing"} for name in active_names
+            )
+            if qualifies(active_names):
+                if active_since is None:
+                    active_since = sample_time
+                    active_samples = 0
+                active_samples += 1
+                active_duration_s = sample_time - active_since
+                if active_duration_s > best_duration_s:
+                    best_duration_s = active_duration_s
+                    best_samples = active_samples
+                best_group = ",".join(active_names)
+                if active_duration_s >= required_duration_s:
+                    force_text = " ".join(
+                        f"{name}={value:.1f}" for name, value in last_active.items()
+                    )
+                    print(
+                        f"held check: {force_text}, threshold="
+                        f"{self.config.held_force_threshold:.1f}, "
+                        f"active={len(active_names)}/{self.config.held_force_count}, "
+                        f"thumb_active={thumb_active}, "
+                        f"close_peak={self._close_peak_active_count}/3, "
+                        f"continuous={active_duration_s:.2f}s/"
+                        f"{required_duration_s:.2f}s, samples={active_samples}, "
+                        f"group={best_group}, held=True"
+                    )
+                    return True
             else:
-                consecutive = 0
-            time.sleep(interval_s)
+                active_since = None
+                active_samples = 0
+            if not self.wait_with_stop(interval_s):
+                self.hold_current_position()
+                return False
 
-        held = best >= self.config.held_required_samples
-        print(f"held check: best={best}/{self.config.held_required_samples}, held={held}")
+        # The final sample may arrive one control interval before the timeout.
+        # If the final reading is still valid, include that interval in the
+        # continuous-pressure duration instead of dropping it at the deadline.
+        try:
+            final_obs = self.observation()
+            final_time = time.monotonic()
+            last_active = {
+                name: abs(float(final_obs.get(f"hand.{name}.force", 0.0)))
+                for name in tracked_names
+            }
+            final_active_names = [
+                name
+                for name in tracked_names
+                if last_active.get(name, 0.0) >= self.config.held_force_threshold
+            ]
+            final_thumb_active = any(
+                name in {"thumb_bend", "thumb_swing"}
+                for name in final_active_names
+            )
+            if (
+                active_since is not None
+                and qualifies(final_active_names)
+            ):
+                best_duration_s = max(best_duration_s, final_time - active_since)
+                best_group = ",".join(final_active_names)
+        except Exception:
+            pass
+
+        held = best_duration_s >= required_duration_s
+        force_text = " ".join(f"{name}={value:.1f}" for name, value in last_active.items())
+        print(
+            f"held check: {force_text}, threshold={self.config.held_force_threshold:.1f}, "
+            f"active_count={sum(value >= self.config.held_force_threshold for value in last_active.values())}/"
+            f"{self.config.held_force_count}, "
+            f"close_peak={self._close_peak_active_count}/3, "
+            f"best_continuous={best_duration_s:.2f}s/{required_duration_s:.2f}s, "
+            f"samples={best_samples}, best_group={best_group or 'none'}, held={held}"
+        )
         return held
 
-    def run_pick_cycle(self, hover_pose: dict[str, float] | None = None) -> bool:
-        obs = self.robot.get_observation()
-        hover = dict(hover_pose or ee_pose_from_observation(obs))
-        start = dict(self.config.start_pose or hover)
-        drop = dict(self.config.drop_pose)
+    def close_for_teleop(self) -> None:
+        self.set_hand_speed(self.config.hand_speed, "teleop close speed")
+        self.set_hand_pose(DEFAULT_CLOSED, "close for teleop")
 
-        grab = dict(hover)
-        grab["ee.z"] = self.config.grab_z
+    def open_while_descending(self) -> None:
+        self.set_hand_speed(self.config.pre_grab_open_speed, "fast open while descending")
+        self.set_hand_pose(BALL_READY_OPEN, "wide open and swing thumb inward while descending")
 
-        lift = dict(hover)
+    def close_at_grab(self) -> bool:
+        self.set_hand_speed(self.config.hand_speed, "restore close speed")
+        return self.set_hand_pose(BALL_CLOSED, "close ball grasp")
+
+    def close_at_grab_adaptive(self) -> bool:
+        if self.config.grasp_mode != 0:
+            print(
+                f"[warn] grasp mode {self.config.grasp_mode} is disabled for the stable path; "
+                "using hand mode 0"
+            )
+        return self._close_at_grab_fixed()
+
+    def _close_at_grab_fixed(self) -> bool:
+        self.set_hand_speed(GRASP_HAND_SPEED, "adaptive close speed")
+        self.set_hand_force(GRASP_HAND_FORCE, "adaptive close force")
+        baseline_obs = self.observation()
+        self._close_peak_names = set()
+        self._close_peak_active_count = 0
+        current_target = {
+            name: float(baseline_obs[f"hand.{name}.pos"])
+            for name in HAND_NAMES
+        }
+
+        phases = [
+            (
+                "little + thumb swing",
+                {"little": 1200.0, "thumb_swing": 900.0},
+                {"little": 120.0, "thumb_swing": 150.0},
+                0.00,
+            ),
+            (
+                "ring + thumb bend",
+                {"ring": 1220.0, "thumb_bend": 1350.0},
+                {"ring": 70.0, "thumb_bend": 50.0},
+                0.15,
+            ),
+            (
+                "middle + index",
+                {"middle": 1350.0, "index": 1350.0},
+                {"middle": 60.0, "index": 60.0},
+                0.30,
+            ),
+        ]
+        print(
+            "Ball grasp close: overlapping phases "
+            "little+thumb_swing -> ring+thumb_bend -> middle+index; "
+            "offsets=0.00/0.15/0.30s, speed=800, thumb_swing target=900"
+        )
+
+        started_at = time.monotonic()
+        started_phases: set[str] = set()
+        completed_phases: set[str] = set()
+        while len(completed_phases) < len(phases):
+            if self.emergency_stop_requested():
+                self.hold_current_position()
+                return False
+
+            elapsed = time.monotonic() - started_at
+            action: RobotAction = {}
+            active_names: list[str] = []
+            for phase_name, phase_goals, phase_steps, phase_offset in phases:
+                if elapsed < phase_offset or phase_name in completed_phases:
+                    continue
+                if phase_name not in started_phases:
+                    started_phases.add(phase_name)
+                    print(f"Grasp phase started: {phase_name}")
+                remaining = False
+                for name, goal in phase_goals.items():
+                    if current_target[name] > goal:
+                        remaining = True
+                        current_target[name] = max(
+                            goal, current_target[name] - phase_steps[name]
+                        )
+                        action[f"hand.{name}.pos"] = current_target[name]
+                        active_names.append(name)
+                if not remaining:
+                    completed_phases.add(phase_name)
+                    print(f"Grasp phase complete: {phase_name}")
+
+            if action:
+                self.robot.send_action(action)
+                obs = self.observation()
+                close_active_names = [
+                    name
+                    for name in HAND_NAMES
+                    if abs(float(obs.get(f"hand.{name}.force", 0.0)))
+                    >= self.config.adaptive_close_force_threshold
+                ]
+                self._close_peak_names.update(close_active_names)
+                self._close_peak_active_count = len(self._close_peak_names)
+                details = []
+                for name in active_names:
+                    actual = float(obs[f"hand.{name}.pos"])
+                    force = float(obs[f"hand.{name}.force"])
+                    details.append(
+                        f"{name}:angle={actual:.0f}/{current_target[name]:.0f} "
+                        f"force={force:.0f}"
+                    )
+                print("  " + " | ".join(details))
+
+            if not self.wait_with_stop(self.config.adaptive_close_settle_s):
+                self.hold_current_position()
+                return False
+
+        print(
+            "Ball grasp close complete; fixed sequence finished. "
+            f"close_peak={self._close_peak_active_count}/6 "
+            f"({','.join(sorted(self._close_peak_names)) or 'none'})"
+        )
+        return True
+
+    def _close_at_grab_feedback(self) -> bool:
+        self.set_hand_speed(GRASP_HAND_SPEED, "adaptive close speed")
+        self.set_hand_force(GRASP_HAND_FORCE, "adaptive close force")
+        baseline_obs = self.observation()
+        self._close_peak_names = set()
+        self._close_peak_active_count = 0
+        current_target = {
+            name: float(baseline_obs[f"hand.{name}.pos"])
+            for name in HAND_NAMES
+        }
+        phases = [
+            ("little + thumb swing", {"little": 1200.0, "thumb_swing": 900.0}, 0.00),
+            ("ring + thumb bend", {"ring": 1220.0, "thumb_bend": 1350.0}, 0.15),
+            ("middle + index", {"middle": 1350.0, "index": 1350.0}, 0.30),
+        ]
+        steps = {
+            "little": 120.0,
+            "ring": 70.0,
+            "middle": 60.0,
+            "index": 60.0,
+            "thumb_bend": 50.0,
+            "thumb_swing": 150.0,
+        }
+        target_force = 300.0 if self.config.grasp_mode == 1 else 220.0
+        correction = 12.0 if self.config.grasp_mode == 1 else 6.0
+        force_band = 50.0 if self.config.grasp_mode == 1 else 70.0
+        label = "force closed-loop" if self.config.grasp_mode == 1 else "impedance"
+        print(
+            f"Ball grasp close: mode={self.config.grasp_mode} ({label}), "
+            f"target_force={target_force:.0f}, correction={correction:.0f}"
+        )
+        started_at = time.monotonic()
+        started_phases: set[str] = set()
+        completed_phases: set[str] = set()
+        while len(completed_phases) < len(phases):
+            if self.emergency_stop_requested():
+                self.hold_current_position()
+                return False
+            elapsed = time.monotonic() - started_at
+            action: RobotAction = {}
+            active_names: list[str] = []
+            for phase_name, goals, phase_offset in phases:
+                if elapsed < phase_offset or phase_name in completed_phases:
+                    continue
+                if phase_name not in started_phases:
+                    started_phases.add(phase_name)
+                    print(f"Grasp phase started: {phase_name}")
+                remaining = False
+                for name, goal in goals.items():
+                    force = abs(float(self.observation().get(f"hand.{name}.force", 0.0)))
+                    if self.config.grasp_mode == 1 and force >= self.config.adaptive_close_force_threshold:
+                        continue
+                    if current_target[name] > goal:
+                        remaining = True
+                        current_target[name] = max(goal, current_target[name] - steps[name])
+                    action[f"hand.{name}.pos"] = current_target[name]
+                    active_names.append(name)
+                if not remaining:
+                    completed_phases.add(phase_name)
+                    print(f"Grasp phase complete: {phase_name}")
+            if action:
+                self.robot.send_action(action)
+                obs = self.observation()
+                for name in HAND_NAMES:
+                    force = abs(float(obs.get(f"hand.{name}.force", 0.0)))
+                    if force >= self.config.adaptive_close_force_threshold:
+                        self._close_peak_names.add(name)
+                self._close_peak_active_count = len(self._close_peak_names)
+                if self.config.grasp_mode == 2:
+                    for name in active_names:
+                        force = abs(float(obs.get(f"hand.{name}.force", 0.0)))
+                        if force > target_force + force_band:
+                            current_target[name] = min(current_target[name] + correction, 1800.0)
+                        elif force < target_force - force_band:
+                            current_target[name] = max(current_target[name] - correction, 850.0)
+            if not self.wait_with_stop(self.config.adaptive_close_settle_s):
+                self.hold_current_position()
+                return False
+        maintain_until = time.monotonic() + 1.0
+        while time.monotonic() < maintain_until:
+            if self.emergency_stop_requested():
+                self.hold_current_position()
+                return False
+            obs = self.observation()
+            action = {}
+            for name in HAND_NAMES:
+                force = abs(float(obs.get(f"hand.{name}.force", 0.0)))
+                if force > target_force + force_band:
+                    current_target[name] = min(current_target[name] + correction, 1800.0)
+                elif force < target_force - force_band:
+                    current_target[name] = max(current_target[name] - correction, 850.0)
+                action[f"hand.{name}.pos"] = current_target[name]
+            self.robot.send_action(action)
+            if not self.wait_with_stop(self.config.adaptive_close_settle_s):
+                self.hold_current_position()
+                return False
+        print(
+            f"Ball grasp close complete; mode={self.config.grasp_mode}, "
+            f"close_peak={self._close_peak_active_count}/6"
+        )
+        return True
+
+    def open_at_drop(self) -> bool:
+        return self.set_hand_pose(DEFAULT_OPEN, "open")
+
+    def close_while_returning(self) -> None:
+        self.set_hand_pose(DEFAULT_CLOSED, "close while returning")
+
+    def show_thumb_gesture(self) -> bool:
+        self.set_hand_speed(self.config.result_thumb_speed, "thumb gesture speed")
+        return self.set_hand_pose(THUMB_GESTURE, "thumb gesture")
+
+    def run_result_gesture(self, held: bool) -> bool:
+        if not self.config.result_gesture:
+            return True
+
+        original = self.current_joints()
+        gesture = list(original)
+        gesture[1] -= self.config.result_gesture_j2_back_deg
+        gesture[5] += (
+            self.config.result_gesture_j6_deg
+            if held
+            else -self.config.result_gesture_j6_deg
+        )
+        label = "success thumbs-up" if held else "empty thumbs-down"
+
+        print(f"Result gesture: {label}")
+        print(f"  original joints: {fmt_joints(original)}")
+        print(f"  gesture joints:  {fmt_joints(gesture)}")
+
+        self.show_thumb_gesture()
+        if self.config.result_thumb_settle_s > 0:
+            if not self.wait_with_stop(self.config.result_thumb_settle_s):
+                self.hold_current_position()
+                return False
+
+        if not self.move_joints_for(
+            gesture,
+            self.config.result_gesture_speed,
+            self.config.result_gesture_duration_s,
+            label,
+        ):
+            return False
+        if self.config.result_gesture_hold_after_s > 0:
+            if not self.move_joints_for(
+                gesture,
+                self.config.result_gesture_speed,
+                self.config.result_gesture_hold_after_s,
+                "result gesture hold",
+            ):
+                return False
+        if not self.move_joints_for(
+            original,
+            self.config.result_gesture_speed,
+            self.config.result_gesture_return_duration_s,
+            "result gesture return",
+        ):
+            return False
+        self.close_while_returning()
+        return True
+
+    def move_to_start_and_hover(self) -> tuple[dict[str, float], dict[str, float]]:
+        start_pose = dict(self.config.start_pose)
+        print("Selecting LeRobot joint_*.pos MOVE_J action for initial move...")
+        print(f"Moving to configured start joints: {fmt_joints(self.config.start_joints)}")
+        if not self.move_joints_for(
+            self.config.start_joints,
+            self.config.speed_rate,
+            self.config.start_duration_s,
+            "start MOVE_J",
+        ):
+            raise RuntimeError("start move failed")
+
+        hover_pose = self.current_pose()
+        if self.config.hover_z is not None:
+            hover_pose = dict(hover_pose)
+            hover_pose["ee.z"] = self.config.hover_z
+            print(f"Moving to keyboard/gamepad hover Z: {self.format_pose(hover_pose)}")
+            if not self.move_ee_for(hover_pose, self.config.hover_duration_s, "hover"):
+                raise RuntimeError("hover move failed")
+        return start_pose, hover_pose
+
+    def run_pick_cycle(
+        self,
+        start_pose: dict[str, float],
+        hover_pose: dict[str, float],
+        drop_pose: dict[str, float],
+    ) -> bool:
+        grab_pose = dict(hover_pose)
+        grab_pose["ee.z"] = self.config.grab_z
+        lift_pose = dict(hover_pose)
         if self.config.lift_z is not None:
-            lift["ee.z"] = self.config.lift_z
+            lift_pose["ee.z"] = self.config.lift_z
 
-        print("Running LeRobot claw pick cycle")
-        print(f"  hover: {self.format_pose(hover)}")
-        print(f"  grab:  {self.format_pose(grab)}")
-        print(f"  lift:  {self.format_pose(lift)}")
-        print(f"  drop:  {self.format_pose(drop)}")
-        print(f"  start: {self.format_pose(start)}")
+        print()
+        print("Running LeRobot pick cycle")
+        print(f"  hover: {self.format_pose(hover_pose)}")
+        print(f"  grab:  {self.format_pose(grab_pose)}")
+        print(f"  lift:  {self.format_pose(lift_pose)}")
+        print(f"  drop:  {self.format_pose(drop_pose)}")
+        print(f"  start: {self.format_pose(start_pose)}")
 
-        self.set_hand_pose(BALL_READY_OPEN)
-        self.move_ee_for(grab, self.config.vertical_duration_s, "descend")
+        self.open_while_descending()
+        if self.emergency_stop_requested():
+            self.hold_current_position()
+            return False
+        if not self.move_ee_for(
+            grab_pose,
+            self.config.vertical_duration_s,
+            "descend",
+            require_reached=True,
+        ):
+            print("[warn] descend failed")
+            return False
 
         if self.config.pre_grab_open_settle_s > 0:
-            time.sleep(self.config.pre_grab_open_settle_s)
-        self.set_hand_pose(BALL_CLOSED)
-        time.sleep(self.config.hand_settle_s)
+            if not self.wait_with_stop(self.config.pre_grab_open_settle_s):
+                self.hold_current_position()
+                return False
+        if self.emergency_stop_requested():
+            self.hold_current_position()
+            return False
+        if not self.close_at_grab_adaptive():
+            print("[warn] adaptive close failed")
+            return False
+        if not self.wait_with_stop(self.config.hand_settle_s):
+            self.hold_current_position()
+            return False
 
-        self.move_ee_for(lift, self.config.vertical_duration_s, "lift")
-        self.move_ee_for(drop, self.config.transfer_duration_s, "drop move")
+        if not self.move_ee_for(
+            lift_pose,
+            self.config.vertical_duration_s,
+            "lift",
+            require_reached=True,
+        ):
+            print("[warn] lift failed")
+            return False
 
-        held = self.held_by_force()
-        self.set_hand_pose(BALL_READY_OPEN)
-        time.sleep(self.config.drop_open_settle_s)
+        held_at_lift = self.held_by_force()
+        if self.emergency_stop_requested():
+            self.hold_current_position()
+            return False
 
-        self.set_hand_pose(BALL_CLOSED)
-        self.move_ee_for(start, self.config.return_duration_s, "return")
-        return held
+        if not held_at_lift:
+            print("Grasp not confirmed at lift; skipping drop and returning to start MOVE_J.")
+            if not self.move_joints_for(
+                self.config.start_joints,
+                self.config.speed_rate,
+                self.config.return_duration_s,
+                "return MOVE_J",
+            ):
+                print("[warn] return MOVE_J failed")
+                return False
+            if not self.run_result_gesture(False):
+                print("[warn] result gesture failed")
+                return False
+            return True
+
+        if not self.move_ee_for(
+            drop_pose,
+            self.config.transfer_duration_s,
+            "drop move",
+            require_reached=True,
+        ):
+            print("[warn] drop move failed")
+            return False
+
+        held_at_drop = held_at_lift
+        self.open_at_drop()
+        if not self.wait_with_stop(self.config.drop_open_settle_s):
+            self.hold_current_position()
+            return False
+
+        self.close_while_returning()
+        if not self.move_ee_for(
+            start_pose,
+            self.config.return_duration_s,
+            "return",
+            require_reached=True,
+        ):
+            print("[warn] return failed")
+            return False
+        if not self.run_result_gesture(held_at_drop):
+            print("[warn] result gesture failed")
+            return False
+        return True
+
+    def capture_teleop_reference(self) -> tuple[list[float], float, float, float]:
+        joint_target = self.current_joints()
+        return joint_target, joint_target[3], joint_target[4], joint_target[5]
+
+    def print_state(self) -> None:
+        print()
+        print(f"pose:   {self.format_pose(self.current_pose())}")
+        print(f"joints: {fmt_joints(self.current_joints())}")
+
+    def run_keyboard_loop(
+        self,
+        start_pose: dict[str, float],
+        keyboard_pose: dict[str, float],
+    ) -> None:
+        joint_target, locked_j4, locked_j5, locked_j6 = self.capture_teleop_reference()
+        drop_pose = dict(self.config.drop_pose or start_pose)
+
+        print(f"Captured start pose: {self.format_pose(start_pose)}")
+        print(f"Keyboard pose:       {self.format_pose(keyboard_pose)}")
+        print(f"Keyboard joints:     {fmt_joints(joint_target)}")
+        print(
+            "Locked joints:       "
+            f"J4={locked_j4:.3f} J5-back={locked_j5:.3f} J6={locked_j6:.3f}"
+        )
+        print(f"Drop pose:           {self.format_pose(drop_pose)}")
+        self.close_for_teleop()
+        print("Keyboard control is active.")
+        print("Use WASD, space to grab, P to print, R to reset, Q to quit.")
+
+        with RawTerminal():
+            while True:
+                key = read_key(0.1)
+                if key is None:
+                    continue
+
+                key_lower = key.lower()
+                if key_lower == "q":
+                    print("\nquit")
+                    break
+                if key_lower == "p":
+                    self.print_state()
+                    continue
+                if key_lower == "r":
+                    joint_target, locked_j4, locked_j5, locked_j6 = (
+                        self.capture_teleop_reference()
+                    )
+                    print(f"\nreference reset joints: {fmt_joints(joint_target)}")
+                    continue
+                if key == " ":
+                    hover_pose = self.current_pose()
+                    ok = self.run_pick_cycle(start_pose, hover_pose, drop_pose)
+                    joint_target, locked_j4, locked_j5, locked_j6 = (
+                        self.capture_teleop_reference()
+                    )
+                    print(
+                        f"cycle {'complete' if ok else 'stopped'}; "
+                        f"current joints={fmt_joints(joint_target)}"
+                    )
+                    continue
+
+                move = key_to_joint_move(key)
+                if move is None:
+                    print(f"\nignored key: {key!r}")
+                    continue
+
+                label, direction = move
+                joint_target, phase = apply_joint_step(
+                    joint_target,
+                    direction,
+                    self.config,
+                    locked_j4,
+                    locked_j5,
+                    locked_j6,
+                )
+                print(
+                    f"\rkey {label} [{phase}]: target joints {fmt_joints(joint_target)}",
+                    end="",
+                    flush=True,
+                )
+                if not self.send_joint_once(joint_target):
+                    print("[warn] nudge failed; stop sending commands and reset if needed.")
+                    break
+
+    def run_gamepad_loop(
+        self,
+        start_pose: dict[str, float],
+        keyboard_pose: dict[str, float],
+    ) -> None:
+        joint_target, locked_j4, locked_j5, locked_j6 = self.capture_teleop_reference()
+        drop_pose = dict(self.config.drop_pose or start_pose)
+
+        print(f"Captured start pose: {self.format_pose(start_pose)}")
+        print(f"Keyboard/gamepad pose: {self.format_pose(keyboard_pose)}")
+        print(f"Gamepad start joints: {fmt_joints(joint_target)}")
+        self.print_gamepad_help()
+        self.close_for_teleop()
+
+        with LinuxJoystick(self.config.gamepad_device) as joystick:
+            last_loop = time.monotonic()
+            last_print = 0.0
+            was_moving = False
+            while True:
+                if self.emergency_stop_requested():
+                    self.hold_current_position()
+                    return
+                now = time.monotonic()
+                dt_s = min(max(now - last_loop, 0.0), 0.1)
+                last_loop = now
+
+                joystick.read_events()
+
+                if joystick.pop_button(1):
+                    self.request_emergency_stop()
+                    self.hold_current_position()
+                    return
+                if joystick.pop_button(3):
+                    self.print_state()
+                if joystick.pop_button(2):
+                    joint_target, locked_j4, locked_j5, locked_j6 = (
+                        self.capture_teleop_reference()
+                    )
+                    print(f"\nreference reset joints: {fmt_joints(joint_target)}")
+
+                if joystick.pop_button(0):
+                    joystick.discard_events()
+                    try:
+                        hover_pose = self.current_pose()
+                        ok = self.run_pick_cycle(start_pose, hover_pose, drop_pose)
+                    finally:
+                        joystick.discard_events()
+                    if self.emergency_stop_requested():
+                        self.hold_current_position()
+                        return
+                    joint_target, _, locked_j5, _ = self.capture_teleop_reference()
+                    joint_target = restore_locked_wrist(joint_target, locked_j4, locked_j6)
+                    if not self.send_joint_once(joint_target):
+                        print("[warn] failed to restore locked J4/J6 after returning to start.")
+                        break
+                    print(
+                        f"cycle {'complete' if ok else 'stopped'}; "
+                        f"current joints={fmt_joints(joint_target)} "
+                        f"locked J4={locked_j4:.3f} J6={locked_j6:.3f}"
+                    )
+
+                x_axis = shaped_axis(
+                    joystick.axis(self.config.gamepad_axis_x, self.config.gamepad_deadzone),
+                    self.config.gamepad_axis_curve,
+                )
+                y_axis = shaped_axis(
+                    joystick.axis(self.config.gamepad_axis_y, self.config.gamepad_deadzone),
+                    self.config.gamepad_axis_curve,
+                )
+
+                moved = False
+                labels = []
+                phases = []
+                if x_axis > 0:
+                    local_config = velocity_config(self.config, dt_s, j1_axis=x_axis)
+                    joint_target, phase = apply_joint_step(
+                        joint_target, 2, local_config, locked_j4, locked_j5, locked_j6
+                    )
+                    labels.append(f"right {abs(x_axis):.2f}")
+                    phases.append(phase)
+                    moved = True
+                elif x_axis < 0:
+                    local_config = velocity_config(self.config, dt_s, j1_axis=x_axis)
+                    joint_target, phase = apply_joint_step(
+                        joint_target, 3, local_config, locked_j4, locked_j5, locked_j6
+                    )
+                    labels.append(f"left {abs(x_axis):.2f}")
+                    phases.append(phase)
+                    moved = True
+
+                reach_axis = -y_axis if self.config.gamepad_invert_y else y_axis
+                if reach_axis > 0:
+                    local_config = velocity_config(self.config, dt_s, reach_axis=reach_axis)
+                    joint_target, phase = apply_joint_step(
+                        joint_target, 0, local_config, locked_j4, locked_j5, locked_j6
+                    )
+                    labels.append(f"forward {abs(reach_axis):.2f}")
+                    phases.append(phase)
+                    moved = True
+                elif reach_axis < 0:
+                    local_config = velocity_config(self.config, dt_s, reach_axis=reach_axis)
+                    joint_target, phase = apply_joint_step(
+                        joint_target, 1, local_config, locked_j4, locked_j5, locked_j6
+                    )
+                    labels.append(f"back {abs(reach_axis):.2f}")
+                    phases.append(phase)
+                    moved = True
+
+                if moved:
+                    actual_joints = self.current_joints()
+                    joint_target = clamp_target_lead(
+                        joint_target,
+                        actual_joints,
+                        self.config.gamepad_lead_limit_deg,
+                    )
+                    if now - last_print >= self.config.gamepad_print_interval:
+                        print(
+                            f"\rgamepad {'+'.join(labels)} [{'/'.join(phases)}]: "
+                            f"joints {fmt_joints(joint_target)}",
+                            end="",
+                            flush=True,
+                        )
+                        last_print = now
+                    if not self.send_joint_once(joint_target):
+                        print("[warn] gamepad nudge failed; stop sending commands and reset if needed.")
+                        break
+                    was_moving = True
+                elif was_moving and self.config.gamepad_stop_reset:
+                    joint_target = self.current_joints()
+                    if not self.send_joint_once(joint_target):
+                        print("[warn] gamepad stop failed; reset if needed.")
+                        break
+                    print(
+                        f"\rgamepad stop: holding current joints {fmt_joints(joint_target)}",
+                        end="",
+                        flush=True,
+                    )
+                    was_moving = False
+
+                select.select([], [], [], 1.0 / self.config.rate_hz)
+
+    def run(self) -> None:
+        self.print_state()
+        if self.emergency_stop_requested():
+            self.hold_current_position()
+            return
+        start_pose, keyboard_pose = self.move_to_start_and_hover()
+        if self.emergency_stop_requested():
+            self.hold_current_position()
+            return
+        if self.config.control == "once":
+            hover_pose = self.current_pose()
+            drop_pose = dict(self.config.drop_pose or start_pose)
+            self.run_pick_cycle(start_pose, hover_pose, drop_pose)
+        elif self.config.control == "gamepad":
+            self.run_gamepad_loop(start_pose, keyboard_pose)
+        else:
+            self.run_keyboard_loop(start_pose, keyboard_pose)
+
+    def print_gamepad_help(self) -> None:
+        print("Gamepad control is active.")
+        print(f"Device: {self.config.gamepad_device}")
+        print("Left stick X: J1 left/right")
+        print("Left stick Y: reach forward/back")
+        print(
+            "Gamepad speed: "
+            f"J1 {self.config.gamepad_j1_speed_dps:.2f} deg/s, "
+            f"reach {self.config.gamepad_reach_speed_dps:.2f} deg/s, "
+            f"curve {self.config.gamepad_axis_curve:.2f}"
+        )
+        print(
+            "Stop behavior: "
+            f"reset target on stick release={self.config.gamepad_stop_reset}, "
+            f"target lead limit={self.config.gamepad_lead_limit_deg:.2f} deg"
+        )
+        print("A / button 0: pick cycle")
+        print("B / button 1: emergency stop, hold position, then D prompt")
+        print("X / button 2: reset joint reference")
+        print("Y / button 3: print current pose")
 
     @staticmethod
     def format_pose(pose: dict[str, float]) -> str:
@@ -187,23 +1430,230 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hand-id", type=int, default=1)
     parser.add_argument("--hand-speed", type=int, default=800)
     parser.add_argument("--hand-force", type=int, default=1500)
-    parser.add_argument("--speed", type=int, default=30)
-    parser.add_argument("--rate-hz", type=float, default=10.0)
+    parser.add_argument("--speed", type=int, default=8)
+    parser.add_argument("--rate-hz", type=float, default=40.0)
+    parser.add_argument("--feedback-timeout", type=float, default=8.0)
+    parser.add_argument("--j1-step-deg", type=float, default=2.0)
+    parser.add_argument("--reach-step-deg", type=float, default=2.0)
+    parser.add_argument("--reach-transition-j2-deg", type=float, default=90.0)
+    parser.add_argument("--reach-pre-j2-gain", type=float, default=1.0)
+    parser.add_argument("--reach-pre-j3-gain", type=float, default=-0.85)
+    parser.add_argument("--reach-pre-j5-gain", type=float, default=-0.05)
+    parser.add_argument("--reach-post-j2-gain", type=float, default=1.0)
+    parser.add_argument("--reach-post-j3-gain", type=float, default=-1.2)
+    parser.add_argument("--reach-post-j5-gain", type=float, default=-0.15)
+    parser.add_argument("--start", type=parse_pose_mm_deg, default=pose_from_values(DEFAULT_START_POSE))
+    parser.add_argument("--start-joints", type=parse_joint_degrees, default=list(DEFAULT_START_JOINTS))
+    parser.add_argument("--start-duration", type=float, default=8.0)
+    parser.add_argument("--hover-z", type=float)
+    parser.add_argument("--hover-duration", type=float, default=6.0)
     parser.add_argument("--grab-z", type=float, required=True)
     parser.add_argument("--lift-z", type=float)
-    parser.add_argument("--drop", type=parse_pose_mm_deg, required=True)
-    parser.add_argument("--start", type=parse_pose_mm_deg)
     parser.add_argument("--vertical-duration", type=float, default=4.0)
     parser.add_argument("--transfer-duration", type=float, default=8.0)
     parser.add_argument("--return-duration", type=float, default=8.0)
+    parser.add_argument("--auto-position-tolerance-mm", type=float, default=2.0)
+    parser.add_argument("--auto-rpy-tolerance-deg", type=float, default=2.0)
+    parser.add_argument("--drop", type=parse_pose_mm_deg)
+    parser.add_argument("--pre-grab-open-speed", type=int, default=1800)
+    parser.add_argument("--adaptive-close-force-threshold", type=float, default=300.0)
+    parser.add_argument("--adaptive-close-step-deg", type=float, default=25.0)
+    parser.add_argument("--adaptive-close-rear-step-deg", type=float, default=35.0)
+    parser.add_argument("--adaptive-close-settle", type=float, default=0.05)
+    parser.add_argument("--grasp-mode", type=int, choices=(0, 1, 2), default=0)
+    parser.add_argument("--hand-settle", type=float, default=1.0)
+    parser.add_argument("--pre-grab-open-settle", type=float, default=1.0)
+    parser.add_argument("--drop-open-settle", type=float, default=4.0)
+    parser.add_argument("--held-force-threshold", type=float, default=100.0)
+    parser.add_argument(
+        "--held-force-fingers",
+        type=parse_name_list,
+        default=list(HAND_NAMES),
+    )
+    parser.add_argument(
+        "--held-force-alt-fingers",
+        type=parse_name_list,
+        default=[],
+    )
+    parser.add_argument("--held-force-count", type=int, default=2)
+    parser.add_argument("--held-check-duration", type=float, default=2.5)
+    parser.add_argument("--held-check-rate-hz", type=float, default=5.0)
+    parser.add_argument("--held-required-samples", type=int, default=15)
+    parser.add_argument("--result-gesture", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--result-gesture-speed", type=int, default=20)
+    parser.add_argument("--result-gesture-j2-back-deg", type=float, default=30.0)
+    parser.add_argument("--result-gesture-j6-deg", type=float, default=90.0)
+    parser.add_argument("--result-thumb-speed", type=int, default=2500)
+    parser.add_argument("--result-thumb-settle", type=float, default=0.8)
+    parser.add_argument("--result-gesture-duration", type=float, default=6.0)
+    parser.add_argument("--result-gesture-hold-after", type=float, default=2.0)
+    parser.add_argument("--result-gesture-return-duration", type=float, default=2.5)
+    parser.add_argument("--control", choices=("keyboard", "gamepad", "once"), default="keyboard")
+    parser.add_argument("--gamepad-device", default="/dev/input/js0")
+    parser.add_argument("--gamepad-deadzone", type=float, default=0.18)
+    parser.add_argument("--gamepad-axis-x", type=int, default=0)
+    parser.add_argument("--gamepad-axis-y", type=int, default=1)
+    parser.add_argument("--gamepad-invert-y", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gamepad-j1-speed-dps", type=float, default=8.0)
+    parser.add_argument("--gamepad-reach-speed-dps", type=float, default=6.0)
+    parser.add_argument("--gamepad-axis-curve", type=float, default=1.8)
+    parser.add_argument("--gamepad-print-interval", type=float, default=0.2)
+    parser.add_argument("--gamepad-lead-limit-deg", type=float, default=1.5)
+    parser.add_argument("--gamepad-stop-reset", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--yes", action="store_true")
     return parser
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    if not 0 <= args.speed <= 100:
+        raise ValueError("--speed must be in [0, 100]")
+    if args.rate_hz <= 0:
+        raise ValueError("--rate-hz must be positive")
+    if args.reach_step_deg <= 0:
+        raise ValueError("--reach-step-deg must be positive")
+    if args.reach_pre_j2_gain <= 0 or args.reach_post_j2_gain <= 0:
+        raise ValueError("reach J2 gains must be positive")
+    if args.hand_settle < 0 or args.pre_grab_open_settle < 0 or args.drop_open_settle < 0:
+        raise ValueError("hand settle times must be non-negative")
+    if args.hand_speed <= 0 or args.pre_grab_open_speed <= 0:
+        raise ValueError("hand speeds must be positive")
+    if args.adaptive_close_force_threshold < 0:
+        raise ValueError("--adaptive-close-force-threshold must be non-negative")
+    if args.adaptive_close_step_deg <= 0 or args.adaptive_close_rear_step_deg <= 0:
+        raise ValueError("adaptive close steps must be positive")
+    if args.adaptive_close_settle < 0:
+        raise ValueError("--adaptive-close-settle must be non-negative")
+    if args.grasp_mode not in (0, 1, 2):
+        raise ValueError("--grasp-mode must be 0, 1, or 2")
+    if args.held_force_threshold < 0:
+        raise ValueError("--held-force-threshold must be non-negative")
+    if not 1 <= args.held_force_count <= len(HAND_NAMES):
+        raise ValueError(f"--held-force-count must be in [1, {len(HAND_NAMES)}]")
+    if args.held_check_duration <= 0 or args.held_check_rate_hz <= 0:
+        raise ValueError("held check duration/rate must be positive")
+    if args.held_required_samples <= 0:
+        raise ValueError("--held-required-samples must be positive")
+    invalid_force_names = set(args.held_force_fingers) - set(HAND_NAMES)
+    if invalid_force_names:
+        raise ValueError(f"bad --held-force-fingers names: {sorted(invalid_force_names)}")
+    invalid_alt_force_names = set(args.held_force_alt_fingers) - set(HAND_NAMES)
+    if invalid_alt_force_names:
+        raise ValueError(f"bad --held-force-alt-fingers names: {sorted(invalid_alt_force_names)}")
+    if not 0 <= args.result_gesture_speed <= 100:
+        raise ValueError("--result-gesture-speed must be in [0, 100]")
+    if args.result_thumb_speed <= 0:
+        raise ValueError("--result-thumb-speed must be positive")
+    if args.result_gesture_j2_back_deg < 0 or args.result_gesture_j6_deg < 0:
+        raise ValueError("result gesture angles must be non-negative")
+    if (
+        args.result_thumb_settle < 0
+        or args.result_gesture_duration < 0
+        or args.result_gesture_hold_after < 0
+        or args.result_gesture_return_duration < 0
+    ):
+        raise ValueError("result gesture durations must be non-negative")
+    if not 0.0 <= args.gamepad_deadzone < 1.0:
+        raise ValueError("--gamepad-deadzone must be in [0, 1)")
+    if args.gamepad_j1_speed_dps <= 0 or args.gamepad_reach_speed_dps <= 0:
+        raise ValueError("gamepad speed values must be positive")
+    if args.gamepad_axis_curve < 1.0:
+        raise ValueError("--gamepad-axis-curve must be >= 1")
+    if args.gamepad_print_interval < 0:
+        raise ValueError("--gamepad-print-interval must be non-negative")
+    if args.gamepad_lead_limit_deg < 0:
+        raise ValueError("--gamepad-lead-limit-deg must be non-negative")
+
+
+def config_from_args(args: argparse.Namespace) -> ClawMachineTaskConfig:
+    return ClawMachineTaskConfig(
+        grab_z=args.grab_z,
+        drop_pose=args.drop,
+        start_pose=args.start,
+        start_joints=args.start_joints,
+        lift_z=args.lift_z,
+        speed_rate=args.speed,
+        rate_hz=args.rate_hz,
+        feedback_timeout_s=args.feedback_timeout,
+        start_duration_s=args.start_duration,
+        hover_z=args.hover_z,
+        hover_duration_s=args.hover_duration,
+        vertical_duration_s=args.vertical_duration,
+        transfer_duration_s=args.transfer_duration,
+        return_duration_s=args.return_duration,
+        auto_position_tolerance_mm=args.auto_position_tolerance_mm,
+        auto_rpy_tolerance_deg=args.auto_rpy_tolerance_deg,
+        j1_step_deg=args.j1_step_deg,
+        reach_step_deg=args.reach_step_deg,
+        reach_transition_j2_deg=args.reach_transition_j2_deg,
+        reach_pre_j2_gain=args.reach_pre_j2_gain,
+        reach_pre_j3_gain=args.reach_pre_j3_gain,
+        reach_pre_j5_gain=args.reach_pre_j5_gain,
+        reach_post_j2_gain=args.reach_post_j2_gain,
+        reach_post_j3_gain=args.reach_post_j3_gain,
+        reach_post_j5_gain=args.reach_post_j5_gain,
+        hand_speed=args.hand_speed,
+        pre_grab_open_speed=args.pre_grab_open_speed,
+        adaptive_close_force_threshold=args.adaptive_close_force_threshold,
+        adaptive_close_step_deg=args.adaptive_close_step_deg,
+        adaptive_close_rear_step_deg=args.adaptive_close_rear_step_deg,
+        adaptive_close_settle_s=args.adaptive_close_settle,
+        grasp_mode=args.grasp_mode,
+        hand_settle_s=args.hand_settle,
+        pre_grab_open_settle_s=args.pre_grab_open_settle,
+        drop_open_settle_s=args.drop_open_settle,
+        held_force_threshold=args.held_force_threshold,
+        held_force_fingers=args.held_force_fingers,
+        held_force_alt_fingers=args.held_force_alt_fingers,
+        held_force_count=args.held_force_count,
+        held_required_samples=args.held_required_samples,
+        held_check_duration_s=args.held_check_duration,
+        held_check_rate_hz=args.held_check_rate_hz,
+        result_gesture=args.result_gesture,
+        result_gesture_speed=args.result_gesture_speed,
+        result_gesture_j2_back_deg=args.result_gesture_j2_back_deg,
+        result_gesture_j6_deg=args.result_gesture_j6_deg,
+        result_thumb_speed=args.result_thumb_speed,
+        result_thumb_settle_s=args.result_thumb_settle,
+        result_gesture_duration_s=args.result_gesture_duration,
+        result_gesture_hold_after_s=args.result_gesture_hold_after,
+        result_gesture_return_duration_s=args.result_gesture_return_duration,
+        control=args.control,
+        gamepad_device=args.gamepad_device,
+        gamepad_deadzone=args.gamepad_deadzone,
+        gamepad_axis_x=args.gamepad_axis_x,
+        gamepad_axis_y=args.gamepad_axis_y,
+        gamepad_invert_y=args.gamepad_invert_y,
+        gamepad_j1_speed_dps=args.gamepad_j1_speed_dps,
+        gamepad_reach_speed_dps=args.gamepad_reach_speed_dps,
+        gamepad_axis_curve=args.gamepad_axis_curve,
+        gamepad_print_interval=args.gamepad_print_interval,
+        gamepad_lead_limit_deg=args.gamepad_lead_limit_deg,
+        gamepad_stop_reset=args.gamepad_stop_reset,
+    )
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
+    validate_args(args)
+
+    print("LeRobot claw-machine teleop")
+    print(f"control={args.control}, CAN={args.can}, hand={args.hand_port}")
+    print(f"grab Z: {args.grab_z:.3f} mm")
+    print(
+        "MOVE_J teleop: "
+        f"j1_step={args.j1_step_deg:.3f} reach_step={args.reach_step_deg:.3f} "
+        f"transition_j2={args.reach_transition_j2_deg:.3f}"
+    )
+    print(
+        "Reach gains: "
+        f"pre=({args.reach_pre_j2_gain:.2f},{args.reach_pre_j3_gain:.2f},"
+        f"{args.reach_pre_j5_gain:.2f}) "
+        f"post=({args.reach_post_j2_gain:.2f},{args.reach_post_j3_gain:.2f},"
+        f"{args.reach_post_j5_gain:.2f})"
+    )
+    print("Initial position uses joint_*.pos MOVE_J; hover/pick/drop use ee.* MOVE_P; teleop uses MOVE_J.")
     if not args.yes:
-        answer = input("Type YES to connect the robot and run one LeRobot claw cycle: ").strip()
+        answer = input("Type YES to connect the robot and run LeRobot claw control: ").strip()
         if answer != "YES":
             print("Aborted.")
             return 1
@@ -218,26 +1668,34 @@ def main() -> int:
             hand_force=args.hand_force,
             max_ee_delta_mm=None,
             max_ee_delta_deg=None,
+            max_hand_delta=None,
         )
     )
-    task = ClawMachineTaskConfig(
-        grab_z=args.grab_z,
-        lift_z=args.lift_z,
-        drop_pose=args.drop,
-        start_pose=args.start,
-        speed_rate=args.speed,
-        rate_hz=args.rate_hz,
-        vertical_duration_s=args.vertical_duration,
-        transfer_duration_s=args.transfer_duration,
-        return_duration_s=args.return_duration,
-    )
-    controller = ClawMachineController(robot, task)
+    controller = ClawMachineController(robot, config_from_args(args))
+    stop_monitor = None
+    if args.control == "gamepad":
+        stop_monitor = GamepadStopMonitor(
+            args.gamepad_device,
+            controller.request_emergency_stop,
+        )
+        stop_monitor.start()
 
     try:
         robot.connect()
-        held = controller.run_pick_cycle()
-        print(f"LeRobot claw cycle complete; held={held}")
+        controller.run()
+    except KeyboardInterrupt:
+        print("\nInterrupted. Motors were not disabled by this script.")
+    except Exception as exc:
+        print(f"\n[warn] {exc}")
+        try:
+            if robot.is_connected:
+                controller.print_state()
+        except Exception:
+            pass
+        return 1
     finally:
+        if stop_monitor is not None:
+            stop_monitor.close()
         if robot.is_connected:
             robot.disconnect()
     return 0

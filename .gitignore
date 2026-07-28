@@ -12,3 +12,7 @@ venv/
 .vscode/
 .DS_Store
 lerobot_robot_piper_upload/
+*.csv
+*.pt
+src/lerobot_robot_piper/rock_paper_scissors/yolo_ball_dataset/images/
+src/lerobot_robot_piper/rock_paper_scissors/yolo_ball_dataset/labels/

@@ -43,7 +43,54 @@ class PiperRH56F2Follower(Robot):
         self.piper: Any = None
         self.hand: RH56F2Hand | None = None
         self._is_connected = False
+        self._active_move_mode: int | None = None
         self.cameras = make_cameras_from_configs(config.cameras)
+
+    def _arm_status_code(self) -> int:
+        return int(self.piper.GetArmStatus().arm_status.arm_status)
+
+    def _ctrl_mode_code(self) -> int:
+        return int(self.piper.GetArmStatus().arm_status.ctrl_mode)
+
+    def _mode_feed_code(self) -> int:
+        return int(self.piper.GetArmStatus().arm_status.mode_feed)
+
+    def _has_real_feedback(self) -> bool:
+        status = self.piper.GetArmStatus()
+        pose = self.piper.GetArmEndPoseMsgs()
+        joints = self.piper.GetArmJointMsgs()
+        ep = pose.end_pose
+        js = joints.joint_state
+        return (
+            status.Hz > 0
+            or pose.Hz > 0
+            or joints.Hz > 0
+            or any(
+                value != 0
+                for value in (
+                    ep.X_axis,
+                    ep.Y_axis,
+                    ep.Z_axis,
+                    ep.RX_axis,
+                    ep.RY_axis,
+                    ep.RZ_axis,
+                    js.joint_1,
+                    js.joint_2,
+                    js.joint_3,
+                    js.joint_4,
+                    js.joint_5,
+                    js.joint_6,
+                )
+            )
+        )
+
+    def _wait_for_real_feedback(self, timeout_s: float = 5.0) -> None:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._has_real_feedback():
+                return
+            time.sleep(0.05)
+        raise RuntimeError("No real Piper feedback received; refusing to command motion.")
 
     def _enable_all(self, timeout_s: float = 5.0) -> bool:
         deadline = time.time() + timeout_s
@@ -56,6 +103,32 @@ class PiperRH56F2Follower(Robot):
                 return True
         logger.warning("Piper enable failed; final enable status=%s", last_status)
         return False
+
+    def _wait_for_mode_ready(self, move_mode: int, timeout_s: float = 5.0) -> None:
+        deadline = time.time() + timeout_s
+        last = ""
+        while time.time() < deadline:
+            self.piper.MotionCtrl_2(0x01, move_mode, self.config.speed_rate, 0x00)
+            self.piper.EnableArm(7, 0x02)
+            time.sleep(0.05)
+            enable_status = list(self.piper.GetArmEnableStatus())
+            ctrl_mode = self._ctrl_mode_code()
+            mode_feed = self._mode_feed_code()
+            arm_status = self._arm_status_code()
+            last = (
+                f"ctrl=0x{ctrl_mode:x} mode=0x{mode_feed:x} "
+                f"arm=0x{arm_status:x} enable={enable_status}"
+            )
+            if (
+                ctrl_mode == 0x01
+                and mode_feed == move_mode
+                and arm_status == 0x00
+                and enable_status
+                and all(enable_status)
+            ):
+                self._active_move_mode = move_mode
+                return
+        raise RuntimeError(f"Piper did not enter move mode 0x{move_mode:x}: {last}")
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -71,8 +144,12 @@ class PiperRH56F2Follower(Robot):
     @cached_property
     def action_features(self) -> dict[str, type]:
         features: dict[str, type] = {f"{name}.pos": float for name in JOINT_NAMES}
+        features["arm.speed_rate"] = float
         features.update({name: float for name in EE_POSE_NAMES})
         features.update({f"hand.{name}.pos": float for name in HAND_NAMES})
+        features.update({f"hand.{name}.speed": float for name in HAND_NAMES})
+        features.update({f"hand.{name}.force_limit": float for name in HAND_NAMES})
+        features["hand.mode"] = float
         return features
 
     @property
@@ -101,14 +178,14 @@ class PiperRH56F2Follower(Robot):
         )
         self.piper.ConnectPort()
         time.sleep(0.2)
+        self._wait_for_real_feedback()
 
         self.piper.MotionCtrl_1(0x02, 0x00, 0x02)
         time.sleep(0.05)
-        self.piper.MotionCtrl_2(0x01, 0x01, self.config.speed_rate, 0x00)
-
         start = self._arm_current_deg()
         if not self._enable_all():
             raise RuntimeError("Failed to enable Piper arm.")
+        self._wait_for_mode_ready(0x01)
         self._send_arm_deg(start, clip_limits=False)
 
         self.hand = RH56F2Hand(
@@ -118,6 +195,7 @@ class PiperRH56F2Follower(Robot):
                 hand_id=self.config.hand_id,
                 speed=self.config.hand_speed,
                 force=self.config.hand_force,
+                mode=self.config.hand_mode,
             )
         )
         self.hand.connect()
@@ -161,6 +239,8 @@ class PiperRH56F2Follower(Robot):
         return {name: value / 1000.0 for name, value in zip(EE_POSE_NAMES, values, strict=True)}
 
     def _send_arm_deg(self, arm_action: dict[str, float], clip_limits: bool = True) -> None:
+        if self._active_move_mode != 0x01:
+            self._wait_for_mode_ready(0x01)
         current = self._arm_current_deg()
         values: list[int] = []
         for name in JOINT_NAMES:
@@ -180,6 +260,8 @@ class PiperRH56F2Follower(Robot):
         self.piper.JointCtrl(*values)
 
     def _send_ee_mm_deg(self, ee_action: dict[str, float]) -> None:
+        if self._active_move_mode != 0x00:
+            self._wait_for_mode_ready(0x00)
         current = self._ee_current_mm_deg()
         values: list[int] = []
         for name in EE_POSE_NAMES:
@@ -214,6 +296,11 @@ class PiperRH56F2Follower(Robot):
     def send_action(self, action: RobotAction) -> RobotAction:
         sent: RobotAction = {}
 
+        if "arm.speed_rate" in action:
+            speed_rate = int(round(float(action["arm.speed_rate"])))
+            self.config.speed_rate = int(np.clip(speed_rate, 0, 100))
+            sent["arm.speed_rate"] = float(self.config.speed_rate)
+
         arm_action = {
             key: float(value)
             for key, value in action.items()
@@ -234,6 +321,33 @@ class PiperRH56F2Follower(Robot):
         if ee_action:
             self._send_ee_mm_deg(ee_action)
             sent.update(ee_action)
+
+        hand_speed_action = {}
+        for name in HAND_NAMES:
+            key = f"hand.{name}.speed"
+            if key in action:
+                hand_speed_action[name] = float(action[key])
+        if hand_speed_action:
+            self.hand.write_positions("speedSet", hand_speed_action)
+            sent.update({f"hand.{name}.speed": value for name, value in hand_speed_action.items()})
+
+        hand_force_action = {}
+        for name in HAND_NAMES:
+            key = f"hand.{name}.force_limit"
+            if key in action:
+                hand_force_action[name] = float(action[key])
+        if hand_force_action:
+            self.hand.write_positions("forceSet", hand_force_action)
+            sent.update(
+                {f"hand.{name}.force_limit": value for name, value in hand_force_action.items()}
+            )
+
+        if "hand.mode" in action:
+            mode = int(round(float(action["hand.mode"])))
+            if mode not in (0, 1, 2):
+                raise ValueError(f"Unsupported RH56F2 hand mode: {mode}")
+            self.hand.write_positions("mode", {name: mode for name in HAND_NAMES})
+            sent["hand.mode"] = float(mode)
 
         hand_action = {}
         for name in HAND_NAMES:
