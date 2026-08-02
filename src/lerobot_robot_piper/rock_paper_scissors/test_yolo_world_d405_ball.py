@@ -10,6 +10,7 @@ import numpy as np
 from ultralytics import YOLOWorld
 
 from test_yolo_d405_ball import depth_at_box
+from rps_prize_controller import rotate_d405_box_ccw_90, rotate_d405_ccw_90, rotate_d405_point_ccw_90
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +57,7 @@ def main() -> int:
             color = np.asanyarray(color_frame.get_data())
             depth_image = np.asanyarray(depth_frame.get_data())
             result = model.predict(color, conf=args.conf, imgsz=args.imgsz, device=0, verbose=False)[0]
-            display = color.copy()
+            display = rotate_d405_ccw_90(color)
             detections: list[tuple[float, tuple[int, int, int, int], float, tuple[float, float, float]]] = []
             intrinsics = depth_frame.profile.as_video_stream_profile().intrinsics
             if result.boxes is not None:
@@ -73,10 +74,12 @@ def main() -> int:
                     depth_m, center = depth_result
                     point = rs.rs2_deproject_pixel_to_point(intrinsics, list(center), depth_m)
                     point_xyz = tuple(float(value) for value in point)
-                    detections.append((confidence, (x0, y0, x1, y1), depth_m, point_xyz))
-                    cv2.rectangle(display, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                    cv2.drawMarker(display, center, (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
-                    cv2.putText(display, f"BALL {confidence:.2f} depth={depth_m:.3f}m", (x0, max(24, y0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 0), 2)
+                    rotated_box = rotate_d405_box_ccw_90((x0, y0, x1, y1), color.shape[1])
+                    rotated_center = rotate_d405_point_ccw_90(center, color.shape[1])
+                    detections.append((confidence, rotated_box, depth_m, point_xyz))
+                    cv2.rectangle(display, (rotated_box[0], rotated_box[1]), (rotated_box[2], rotated_box[3]), (0, 255, 0), 2)
+                    cv2.drawMarker(display, rotated_center, (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+                    cv2.putText(display, f"BALL {confidence:.2f} depth={depth_m:.3f}m", (rotated_box[0], max(24, rotated_box[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 0), 2)
             detections.sort(key=lambda item: item[0], reverse=True)
             cv2.putText(display, f"balls={len(detections)}  q:quit p:print", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
             cv2.imshow("YOLO-World D405 ball test", display)

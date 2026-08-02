@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 
 from collect_eye_hand_samples import read_piper_pose
-from rps_prize_controller import D405BallCamera
+from rps_prize_controller import D405BallCamera, rotate_d405_ccw_90, rotate_d405_observation_ccw_90
 from solve_eye_hand_calibration import make_transform, rpy_to_matrix
 
 
@@ -71,14 +71,15 @@ def main() -> int:
                 continue
             color, depth, depth_frame = packet
             observation = camera.detect_ball(color, depth, depth_frame)
-            display = color.copy()
+            display = rotate_d405_ccw_90(color)
             if observation is not None:
                 piper_pose = read_piper_pose(piper)
                 base_tool = make_transform(rpy_to_matrix(*piper_pose[3:]), np.asarray(piper_pose[:3]))
                 camera_point = np.array([*observation.camera_xyz_m, 1.0])
                 base_point = base_tool @ tool_camera @ camera_point
-                cv2.circle(display, observation.pixel, int(observation.radius_px), (0, 255, 0), 2)
-                cv2.drawMarker(display, observation.pixel, (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+                rotated_observation = rotate_d405_observation_ccw_90(observation, color.shape[1])
+                cv2.circle(display, rotated_observation.pixel, int(rotated_observation.radius_px), (0, 255, 0), 2)
+                cv2.drawMarker(display, rotated_observation.pixel, (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
                 cv2.putText(display, f"base target=({base_point[0]:.3f},{base_point[1]:.3f},{base_point[2]:.3f})m", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
                 cv2.putText(display, "p: print target   q: quit", (20, display.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
                 key = cv2.waitKey(1) & 0xFF

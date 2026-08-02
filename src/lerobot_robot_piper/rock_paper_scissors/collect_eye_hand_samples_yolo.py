@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from rps_prize_controller import BallObservation
+from rps_prize_controller import BallObservation, rotate_d405_ccw_90, rotate_d405_observation_ccw_90
 from test_yolo_d405_ball import depth_at_box
 from collect_eye_hand_samples import parse_roi, read_piper_pose
 
@@ -137,13 +137,14 @@ def main() -> int:
                             observations.clear()
                     observations = (observations + [candidate])[-args.stable_frames:]
                 stable = median_observation(observations) if len(observations) >= args.stable_frames else None
-                display = color.copy()
+                display = rotate_d405_ccw_90(color)
                 if candidate is None:
                     cv2.putText(display, "BALL NOT FOUND", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 else:
-                    cv2.drawMarker(display, candidate.pixel, (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+                    rotated_candidate = rotate_d405_observation_ccw_90(candidate, color.shape[1])
+                    cv2.drawMarker(display, rotated_candidate.pixel, (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
                     cv2.putText(display, f"BALL conf={confidence:.2f} xyz=({candidate.camera_xyz_m[0]:.3f},{candidate.camera_xyz_m[1]:.3f},{candidate.camera_xyz_m[2]:.3f})", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-                cv2.putText(display, f"stable={len(observations)}/{args.stable_frames}  s:save q:quit", (20, args.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                cv2.putText(display, f"stable={len(observations)}/{args.stable_frames}  s:save q:quit", (20, display.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
                 cv2.imshow("YOLO26 eye-hand collection", display)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):

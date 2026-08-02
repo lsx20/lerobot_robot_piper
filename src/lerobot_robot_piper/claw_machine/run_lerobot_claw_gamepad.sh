@@ -14,6 +14,8 @@ python -m lerobot_robot_piper.claw_machine.lerobot_claw \
   --gamepad-axis-curve 2.4 \
   --gamepad-deadzone 0.22 \
   --gamepad-lead-limit-deg 2.5 \
+  --gamepad-pick-button 1 \
+  --gamepad-stop-button 0 \
   --gamepad-stop-reset \
   --grab-z 205 \
   --lift-z 287.496 \
@@ -30,6 +32,11 @@ python -m lerobot_robot_piper.claw_machine.lerobot_claw \
   --held-check-duration 1.0 \
   --held-check-rate-hz 5 \
   --held-required-samples 3 \
+  --classify-ball \
+  --ball-hover-duration 2.0 \
+  --ball-hover-rate-hz 10 \
+  --ball-squeeze-duration 3.0 \
+  --ball-ab-friction-threshold 0.1464 \
   --result-gesture \
   --result-gesture-speed 20 \
   --result-gesture-j2-back-deg 30 \

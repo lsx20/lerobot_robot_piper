@@ -12,7 +12,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from rps_prize_controller import BallObservation, D405BallCamera
+from rps_prize_controller import BallObservation, D405BallCamera, rotate_d405_ccw_90, rotate_d405_observation_ccw_90
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -146,7 +146,13 @@ def main() -> int:
                 else:
                     observations.clear()
                 stable = median_observation(observations) if len(observations) >= args.stable_frames else None
-                display = draw_frame(color, stable or observation, 0)
+                display = rotate_d405_ccw_90(color)
+                displayed_observation = (
+                    rotate_d405_observation_ccw_90(stable or observation, color.shape[1])
+                    if (stable or observation) is not None
+                    else None
+                )
+                display = draw_frame(display, displayed_observation, 0)
                 cv2.imshow("Eye-hand sample collection", display)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("s"):

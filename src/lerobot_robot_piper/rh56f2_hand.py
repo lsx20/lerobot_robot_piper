@@ -5,6 +5,7 @@ import serial
 
 
 HAND_NAMES = ["little", "ring", "middle", "index", "thumb_bend", "thumb_swing"]
+TOUCH_FINGER_NAMES = ["little", "ring", "middle", "index", "thumb"]
 
 REG = {
     "mode": 1100,
@@ -16,6 +17,7 @@ REG = {
     "errCode": 1082,
     "statusCode": 1088,
     "temp": 1094,
+    "touchData": 3000,
 }
 
 DEFAULT_OPEN = {
@@ -79,6 +81,10 @@ def _unpack_six(raw: list[int]) -> list[int]:
             value -= 65536
         values.append(value)
     return values
+
+
+def _u16_le(raw: list[int], idx: int) -> int:
+    return int(raw[idx]) | (int(raw[idx + 1]) << 8)
 
 
 class RH56F2Hand:
@@ -150,6 +156,35 @@ class RH56F2Hand:
         if not values:
             raise RuntimeError(f"No RH56F2 response while reading {key}")
         return {name: float(value) for name, value in zip(HAND_NAMES, values, strict=True)}
+
+    def read_touch_data(self) -> dict[str, dict[str, dict[str, float]] | dict[str, float]]:
+        """Read RH56F2 fingertip tactile data from the vendor touch register.
+
+        The vendor SDK exposes one tactile tuple per finger, not a fingertip
+        taxel matrix: normal force, tangential force, tangential direction, and
+        proximity. It also exposes nine palm values.
+        """
+        raw = self._read_register(REG["touchData"], 0x44)
+        if len(raw) < 68:
+            raise RuntimeError("No RH56F2 response while reading touchData")
+
+        fingers: dict[str, dict[str, float]] = {}
+        for idx, name in enumerate(TOUCH_FINGER_NAMES):
+            base = idx * 10
+            proximity = raw[base + 6] | (raw[base + 7] << 8) | (raw[base + 8] << 16)
+            fingers[name] = {
+                "normal": float(_u16_le(raw, base)),
+                "tangential": float(_u16_le(raw, base + 2)),
+                "angle": float(_u16_le(raw, base + 4)),
+                "proximity": float(proximity),
+            }
+
+        palm_start = len(TOUCH_FINGER_NAMES) * 10
+        palm = {
+            f"palm_{idx + 1}": float(_u16_le(raw, palm_start + idx * 2))
+            for idx in range(9)
+        }
+        return {"fingers": fingers, "palm": palm}
 
     def write_positions(self, key: str, values_by_name: dict[str, float]) -> bool:
         current = {name: 0.0 for name in HAND_NAMES}

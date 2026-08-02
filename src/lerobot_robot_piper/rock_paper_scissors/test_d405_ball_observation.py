@@ -11,7 +11,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from rps_prize_controller import BallObservation, D405BallCamera
+from rps_prize_controller import (
+    BallObservation,
+    D405BallCamera,
+    rotate_d405_ccw_90,
+    rotate_d405_observation_ccw_90,
+)
 
 
 def parse_roi(value: str) -> tuple[int, int, int, int]:
@@ -145,9 +150,16 @@ def main() -> int:
                 stable_xyz = None
                 if len(observations) >= args.stable_frames:
                     stable_xyz = tuple(float(value) for value in np.median([item.camera_xyz_m for item in observations], axis=0))
-                display = draw_candidates(color, candidates)
-                display = draw_observation(display, median_observation(observations) or observation, stable_xyz)
-                cv2.putText(display, "s: save sample   q: quit", (20, args.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                display = rotate_d405_ccw_90(color)
+                rotated_candidates = [rotate_d405_observation_ccw_90(candidate, color.shape[1]) for candidate in candidates]
+                rotated_observation = (
+                    rotate_d405_observation_ccw_90(observation, color.shape[1])
+                    if observation is not None
+                    else None
+                )
+                display = draw_candidates(display, rotated_candidates)
+                display = draw_observation(display, rotated_observation, stable_xyz)
+                cv2.putText(display, "s: save sample   q: quit", (20, display.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
                 cv2.imshow("D405 ball observation", display)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("s"):

@@ -10,6 +10,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from rps_prize_controller import rotate_d405_ccw_90
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -84,7 +86,8 @@ def main() -> int:
             if not color_frame:
                 continue
             color = np.asanyarray(color_frame.get_data())
-            display = draw_status(color, train_index - 1, val_index - 1, message)
+            rotated = rotate_d405_ccw_90(color)
+            display = draw_status(rotated, train_index - 1, val_index - 1, message)
             cv2.imshow("D405 YOLO image collector", display)
             key = cv2.waitKey(1) & 0xFF
             now = time.monotonic()
@@ -94,7 +97,7 @@ def main() -> int:
                 destination = train_dir / f"image_{train_index:06d}.jpg"
                 train_index += 1
                 last_save_time = now
-                ok = cv2.imwrite(str(destination), color, [cv2.IMWRITE_JPEG_QUALITY, args.jpg_quality])
+                ok = cv2.imwrite(str(destination), rotated, [cv2.IMWRITE_JPEG_QUALITY, args.jpg_quality])
                 if not ok:
                     message = f"FAILED: {destination}"
                     print(message)
@@ -115,7 +118,7 @@ def main() -> int:
                 destination = val_dir / f"image_{val_index:06d}.jpg"
                 val_index += 1
                 split_name = "val"
-            ok = cv2.imwrite(str(destination), color, [cv2.IMWRITE_JPEG_QUALITY, args.jpg_quality])
+            ok = cv2.imwrite(str(destination), rotated, [cv2.IMWRITE_JPEG_QUALITY, args.jpg_quality])
             if not ok:
                 message = f"FAILED: {destination}"
                 print(message)

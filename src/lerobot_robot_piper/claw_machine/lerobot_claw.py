@@ -35,6 +35,13 @@ try:
     from ..piper_follower import JOINT_LIMITS_DEG, JOINT_NAMES
     from ..piper_rh56f2_follower import EE_POSE_NAMES, PiperRH56F2Follower
     from ..rh56f2_hand import DEFAULT_CLOSED, DEFAULT_OPEN, HAND_NAMES
+    from ..rock_paper_scissors.ball_tactile_classifier.claw_integration import (
+        DEFAULT_MODEL as DEFAULT_BALL_MODEL,
+        DEFAULT_OUTPUT as DEFAULT_BALL_OUTPUT,
+        DEFAULT_REFERENCE_SAMPLES as DEFAULT_BALL_REFERENCE_SAMPLES,
+        BallClassifierConfig,
+        HeldBallClassifier,
+    )
 except ImportError:  # Allow running from this directory with: python lerobot_claw.py
     package_parent = Path(__file__).resolve().parents[2]
     if str(package_parent) not in sys.path:
@@ -43,6 +50,13 @@ except ImportError:  # Allow running from this directory with: python lerobot_cl
     from lerobot_robot_piper.piper_follower import JOINT_LIMITS_DEG, JOINT_NAMES
     from lerobot_robot_piper.piper_rh56f2_follower import EE_POSE_NAMES, PiperRH56F2Follower
     from lerobot_robot_piper.rh56f2_hand import DEFAULT_CLOSED, DEFAULT_OPEN, HAND_NAMES
+    from lerobot_robot_piper.rock_paper_scissors.ball_tactile_classifier.claw_integration import (
+        DEFAULT_MODEL as DEFAULT_BALL_MODEL,
+        DEFAULT_OUTPUT as DEFAULT_BALL_OUTPUT,
+        DEFAULT_REFERENCE_SAMPLES as DEFAULT_BALL_REFERENCE_SAMPLES,
+        BallClassifierConfig,
+        HeldBallClassifier,
+    )
 
 
 JS_EVENT_FORMAT = "IhBB"
@@ -173,10 +187,11 @@ class LinuxJoystick:
 
 
 class GamepadStopMonitor:
-    """Monitor button 1 without consuming the teleop joystick stream."""
+    """Monitor the stop button without consuming the teleop joystick stream."""
 
-    def __init__(self, device: str, on_stop: callable) -> None:
+    def __init__(self, device: str, stop_button: int, on_stop: callable) -> None:
         self.device = device
+        self.stop_button = stop_button
         self.on_stop = on_stop
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -190,7 +205,7 @@ class GamepadStopMonitor:
             with LinuxJoystick(self.device) as joystick:
                 while not self.stop_event.is_set():
                     joystick.read_events()
-                    if joystick.pop_button(1):
+                    if joystick.pop_button(self.stop_button):
                         self.on_stop()
                         return
                     joystick.discard_events()
@@ -222,6 +237,11 @@ class ClawMachineTaskConfig:
     vertical_duration_s: float = 4.0
     transfer_duration_s: float = 8.0
     return_duration_s: float = 8.0
+    soft_arrival: bool = True
+    soft_arrival_min_speed: int = 2
+    soft_arrival_joint_slow_deg: float = 12.0
+    soft_arrival_pose_slow_mm: float = 80.0
+    soft_arrival_pose_slow_deg: float = 20.0
     auto_position_tolerance_mm: float = 2.0
     auto_rpy_tolerance_deg: float = 2.0
     j1_step_deg: float = 2.0
@@ -240,8 +260,8 @@ class ClawMachineTaskConfig:
     adaptive_close_rear_step_deg: float = 35.0
     adaptive_close_settle_s: float = 0.05
     grasp_mode: int = 0
-    hand_settle_s: float = 1.0
-    pre_grab_open_settle_s: float = 1.0
+    hand_settle_s: float = 0.0
+    pre_grab_open_settle_s: float = 0.0
     drop_open_settle_s: float = 4.0
     held_force_threshold: float = 100.0
     held_force_fingers: list[str] = field(
@@ -257,10 +277,11 @@ class ClawMachineTaskConfig:
     result_gesture_j2_back_deg: float = 30.0
     result_gesture_j6_deg: float = 90.0
     result_thumb_speed: int = 2500
-    result_thumb_settle_s: float = 0.8
+    result_thumb_settle_s: float = 0.0
     result_gesture_duration_s: float = 6.0
-    result_gesture_hold_after_s: float = 2.0
+    result_gesture_hold_after_s: float = 0.0
     result_gesture_return_duration_s: float = 2.5
+    failed_return_hold_s: float = 0.5
     control: str = "keyboard"
     gamepad_device: str = "/dev/input/js0"
     gamepad_deadzone: float = 0.18
@@ -273,6 +294,9 @@ class ClawMachineTaskConfig:
     gamepad_print_interval: float = 0.2
     gamepad_lead_limit_deg: float = 1.5
     gamepad_stop_reset: bool = True
+    gamepad_pick_button: int = 0
+    gamepad_stop_button: int = 1
+    ball_classifier_config: BallClassifierConfig | None = None
 
 
 def pose_from_values(values: list[float]) -> dict[str, float]:
@@ -474,6 +498,11 @@ class ClawMachineController:
         self._emergency_stop = threading.Event()
         self._close_peak_active_count = 0
         self._close_peak_names: set[str] = set()
+        self.ball_classifier = (
+            HeldBallClassifier(config.ball_classifier_config)
+            if config.ball_classifier_config is not None
+            else None
+        )
 
     def request_emergency_stop(self) -> None:
         if not self._emergency_stop.is_set():
@@ -496,6 +525,9 @@ class ClawMachineController:
 
     def observation(self) -> RobotObservation:
         return self.robot.get_observation()
+
+    def raw_hand(self) -> object | None:
+        return getattr(self.robot, "hand", None)
 
     def current_pose(self) -> dict[str, float]:
         obs = self.observation()
@@ -550,12 +582,38 @@ class ClawMachineController:
         self.robot.send_action(self.joint_action(target, speed))
         return True
 
+    def soft_speed_from_ratio(self, base_speed: int, ratio: float) -> int:
+        if not self.config.soft_arrival:
+            return base_speed
+        min_speed = min(base_speed, max(1, int(self.config.soft_arrival_min_speed)))
+        ratio = max(0.0, min(1.0, ratio))
+        return int(round(min_speed + (base_speed - min_speed) * ratio))
+
+    def joint_soft_speed(self, target: list[float], base_speed: int) -> int:
+        current = self.current_joints()
+        j1_j2_error = max(
+            abs(current[0] - target[0]),
+            abs(current[1] - target[1]),
+        )
+        ratio = j1_j2_error / max(self.config.soft_arrival_joint_slow_deg, 1e-6)
+        return self.soft_speed_from_ratio(base_speed, ratio)
+
+    def pose_soft_speed(self, pose: dict[str, float], base_speed: int) -> int:
+        actual = self.current_pose()
+        xyz_error, rpy_error = self.pose_error_mm_deg(actual, pose)
+        ratio = max(
+            xyz_error / max(self.config.soft_arrival_pose_slow_mm, 1e-6),
+            rpy_error / max(self.config.soft_arrival_pose_slow_deg, 1e-6),
+        )
+        return self.soft_speed_from_ratio(base_speed, ratio)
+
     def move_joints_for(
         self,
         target: list[float],
         speed: int,
         duration_s: float,
         label: str,
+        soft_arrival: bool = True,
     ) -> bool:
         deadline = time.time() + duration_s
         interval_s = 1.0 / self.config.rate_hz
@@ -563,8 +621,47 @@ class ClawMachineController:
             if self.emergency_stop_requested():
                 self.hold_current_position()
                 return False
-            if not self.send_joint_once(target, speed):
+            command_speed = self.joint_soft_speed(target, speed) if soft_arrival else speed
+            if not self.send_joint_once(target, command_speed):
                 return False
+            if not self.wait_with_stop(interval_s):
+                self.hold_current_position()
+                return False
+        print(f"{label}: joints {fmt_joints(target)}")
+        return True
+
+    def move_joints_until_reached(
+        self,
+        target: list[float],
+        speed: int,
+        max_duration_s: float,
+        hold_after_reached_s: float,
+        label: str,
+        tolerance_deg: float = 1.0,
+    ) -> bool:
+        deadline = time.time() + max_duration_s
+        hold_deadline: float | None = None
+        interval_s = 1.0 / self.config.rate_hz
+        while time.time() < deadline:
+            if self.emergency_stop_requested():
+                self.hold_current_position()
+                return False
+            command_speed = self.joint_soft_speed(target, speed)
+            if not self.send_joint_once(target, command_speed):
+                return False
+            current = self.current_joints()
+            reached = all(
+                abs(current[index] - target[index]) <= tolerance_deg
+                for index in range(min(len(current), len(target)))
+            )
+            if reached:
+                if hold_deadline is None:
+                    hold_deadline = time.time() + hold_after_reached_s
+                elif time.time() >= hold_deadline:
+                    print(f"{label}: joints {fmt_joints(target)}")
+                    return True
+            else:
+                hold_deadline = None
             if not self.wait_with_stop(interval_s):
                 self.hold_current_position()
                 return False
@@ -594,7 +691,8 @@ class ClawMachineController:
             if self.emergency_stop_requested():
                 self.hold_current_position()
                 return False
-            self.robot.send_action(self.ee_action(pose))
+            command_speed = self.pose_soft_speed(pose, self.config.speed_rate)
+            self.robot.send_action(self.ee_action(pose, command_speed))
             if not self.wait_with_stop(interval_s):
                 self.hold_current_position()
                 return False
@@ -758,15 +856,15 @@ class ClawMachineController:
         self.set_hand_speed(self.config.hand_speed, "restore close speed")
         return self.set_hand_pose(BALL_CLOSED, "close ball grasp")
 
-    def close_at_grab_adaptive(self) -> bool:
+    def close_at_grab_adaptive(self, ball_trial: object | None = None) -> bool:
         if self.config.grasp_mode != 0:
             print(
                 f"[warn] grasp mode {self.config.grasp_mode} is disabled for the stable path; "
                 "using hand mode 0"
             )
-        return self._close_at_grab_fixed()
+        return self._close_at_grab_fixed(ball_trial)
 
-    def _close_at_grab_fixed(self) -> bool:
+    def _close_at_grab_fixed(self, ball_trial: object | None = None) -> bool:
         self.set_hand_speed(GRASP_HAND_SPEED, "adaptive close speed")
         self.set_hand_force(GRASP_HAND_FORCE, "adaptive close force")
         baseline_obs = self.observation()
@@ -836,6 +934,8 @@ class ClawMachineController:
             if action:
                 self.robot.send_action(action)
                 obs = self.observation()
+                if self.ball_classifier is not None and ball_trial is not None:
+                    self.ball_classifier.record_observation_frame(ball_trial, obs, started_at)
                 close_active_names = [
                     name
                     for name in HAND_NAMES
@@ -1006,6 +1106,7 @@ class ClawMachineController:
             self.config.result_gesture_speed,
             self.config.result_gesture_duration_s,
             label,
+            soft_arrival=False,
         ):
             return False
         if self.config.result_gesture_hold_after_s > 0:
@@ -1014,6 +1115,7 @@ class ClawMachineController:
                 self.config.result_gesture_speed,
                 self.config.result_gesture_hold_after_s,
                 "result gesture hold",
+                soft_arrival=False,
             ):
                 return False
         if not self.move_joints_for(
@@ -1021,6 +1123,7 @@ class ClawMachineController:
             self.config.result_gesture_speed,
             self.config.result_gesture_return_duration_s,
             "result gesture return",
+            soft_arrival=False,
         ):
             return False
         self.close_while_returning()
@@ -1087,12 +1190,21 @@ class ClawMachineController:
         if self.emergency_stop_requested():
             self.hold_current_position()
             return False
-        if not self.close_at_grab_adaptive():
+        ball_trial = None
+        ball_hand = self.raw_hand()
+        if self.ball_classifier is not None:
+            if ball_hand is None:
+                print("[warn] ball classifier unavailable: robot has no raw RH56F2 hand handle.")
+            else:
+                try:
+                    ball_trial = self.ball_classifier.begin_trial(ball_hand)
+                    print("ball classifier: baseline captured before closing.")
+                except Exception as exc:
+                    print(f"[warn] ball classifier baseline failed: {exc}")
+        if not self.close_at_grab_adaptive(ball_trial):
             print("[warn] adaptive close failed")
             return False
-        if not self.wait_with_stop(self.config.hand_settle_s):
-            self.hold_current_position()
-            return False
+        print("Grasp close complete; lifting immediately to check hover.")
 
         if not self.move_ee_for(
             lift_pose,
@@ -1103,17 +1215,27 @@ class ClawMachineController:
             print("[warn] lift failed")
             return False
 
-        held_at_lift = self.held_by_force()
+        if self.ball_classifier is not None and ball_trial is not None and ball_hand is not None:
+            try:
+                classification_row = self.ball_classifier.classify_held(ball_hand, ball_trial)
+                predicted_label = str(classification_row.get("predicted_label") or "")
+                held_at_lift = predicted_label not in {"", "NONE"}
+            except Exception as exc:
+                print(f"[warn] ball classifier failed: {exc}")
+                held_at_lift = False
+        else:
+            held_at_lift = self.held_by_force()
         if self.emergency_stop_requested():
             self.hold_current_position()
             return False
 
         if not held_at_lift:
             print("Grasp not confirmed at lift; skipping drop and returning to start MOVE_J.")
-            if not self.move_joints_for(
+            if not self.move_joints_until_reached(
                 self.config.start_joints,
                 self.config.speed_rate,
                 self.config.return_duration_s,
+                self.config.failed_return_hold_s,
                 "return MOVE_J",
             ):
                 print("[warn] return MOVE_J failed")
@@ -1263,19 +1385,23 @@ class ClawMachineController:
 
                 joystick.read_events()
 
-                if joystick.pop_button(1):
+                if joystick.pop_button(self.config.gamepad_stop_button):
+                    print(f"\ngamepad button {self.config.gamepad_stop_button}: emergency stop")
                     self.request_emergency_stop()
                     self.hold_current_position()
                     return
                 if joystick.pop_button(3):
+                    print("\ngamepad button 3: print state")
                     self.print_state()
                 if joystick.pop_button(2):
+                    print("\ngamepad button 2: reset joint reference")
                     joint_target, locked_j4, locked_j5, locked_j6 = (
                         self.capture_teleop_reference()
                     )
                     print(f"\nreference reset joints: {fmt_joints(joint_target)}")
 
-                if joystick.pop_button(0):
+                if joystick.pop_button(self.config.gamepad_pick_button):
+                    print(f"\ngamepad button {self.config.gamepad_pick_button}: pick cycle")
                     joystick.discard_events()
                     try:
                         hover_pose = self.current_pose()
@@ -1410,8 +1536,11 @@ class ClawMachineController:
             f"reset target on stick release={self.config.gamepad_stop_reset}, "
             f"target lead limit={self.config.gamepad_lead_limit_deg:.2f} deg"
         )
-        print("A / button 0: pick cycle")
-        print("B / button 1: emergency stop, hold position, then D prompt")
+        print(f"A / button {self.config.gamepad_pick_button}: pick cycle")
+        print(
+            f"B / button {self.config.gamepad_stop_button}: "
+            "emergency stop, hold position, then D prompt"
+        )
         print("X / button 2: reset joint reference")
         print("Y / button 3: print current pose")
 
@@ -1452,6 +1581,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vertical-duration", type=float, default=4.0)
     parser.add_argument("--transfer-duration", type=float, default=8.0)
     parser.add_argument("--return-duration", type=float, default=8.0)
+    parser.add_argument("--soft-arrival", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--soft-arrival-min-speed", type=int, default=2)
+    parser.add_argument("--soft-arrival-joint-slow-deg", type=float, default=12.0)
+    parser.add_argument("--soft-arrival-pose-slow-mm", type=float, default=80.0)
+    parser.add_argument("--soft-arrival-pose-slow-deg", type=float, default=20.0)
     parser.add_argument("--auto-position-tolerance-mm", type=float, default=2.0)
     parser.add_argument("--auto-rpy-tolerance-deg", type=float, default=2.0)
     parser.add_argument("--drop", type=parse_pose_mm_deg)
@@ -1461,8 +1595,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-close-rear-step-deg", type=float, default=35.0)
     parser.add_argument("--adaptive-close-settle", type=float, default=0.05)
     parser.add_argument("--grasp-mode", type=int, choices=(0, 1, 2), default=0)
-    parser.add_argument("--hand-settle", type=float, default=1.0)
-    parser.add_argument("--pre-grab-open-settle", type=float, default=1.0)
+    parser.add_argument("--hand-settle", type=float, default=0.0)
+    parser.add_argument("--pre-grab-open-settle", type=float, default=0.0)
     parser.add_argument("--drop-open-settle", type=float, default=4.0)
     parser.add_argument("--held-force-threshold", type=float, default=100.0)
     parser.add_argument(
@@ -1484,10 +1618,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--result-gesture-j2-back-deg", type=float, default=30.0)
     parser.add_argument("--result-gesture-j6-deg", type=float, default=90.0)
     parser.add_argument("--result-thumb-speed", type=int, default=2500)
-    parser.add_argument("--result-thumb-settle", type=float, default=0.8)
+    parser.add_argument("--result-thumb-settle", type=float, default=0.0)
     parser.add_argument("--result-gesture-duration", type=float, default=6.0)
-    parser.add_argument("--result-gesture-hold-after", type=float, default=2.0)
+    parser.add_argument("--result-gesture-hold-after", type=float, default=0.0)
     parser.add_argument("--result-gesture-return-duration", type=float, default=2.5)
+    parser.add_argument("--failed-return-hold", type=float, default=0.5)
     parser.add_argument("--control", choices=("keyboard", "gamepad", "once"), default="keyboard")
     parser.add_argument("--gamepad-device", default="/dev/input/js0")
     parser.add_argument("--gamepad-deadzone", type=float, default=0.18)
@@ -1500,6 +1635,55 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gamepad-print-interval", type=float, default=0.2)
     parser.add_argument("--gamepad-lead-limit-deg", type=float, default=1.5)
     parser.add_argument("--gamepad-stop-reset", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gamepad-pick-button", type=int, default=0)
+    parser.add_argument("--gamepad-stop-button", type=int, default=1)
+    parser.add_argument(
+        "--classify-ball",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="At lift hover, decide NONE/A/B/C with the tactile classifier.",
+    )
+    parser.add_argument("--ball-model", type=Path, default=DEFAULT_BALL_MODEL)
+    parser.add_argument("--ball-output", type=Path, default=DEFAULT_BALL_OUTPUT)
+    parser.add_argument("--ball-visual-reference-samples", type=Path, default=DEFAULT_BALL_REFERENCE_SAMPLES)
+    parser.add_argument("--ball-contact-threshold", type=float, default=70.0)
+    parser.add_argument("--ball-hover-duration", type=float, default=1.5)
+    parser.add_argument("--ball-hover-rate-hz", type=float, default=10.0)
+    parser.add_argument("--ball-squeeze-delta", type=float, default=40.0)
+    parser.add_argument("--ball-squeeze-duration", type=float, default=3.0)
+    parser.add_argument("--ball-ab-squeeze-test", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--ball-ab-squeeze-threshold", type=float, default=190.0)
+    parser.add_argument("--ball-ab-squeeze-a-standard", type=float, default=238.0)
+    parser.add_argument("--ball-ab-squeeze-b-standard", type=float, default=142.5)
+    parser.add_argument(
+        "--ball-ab-squeeze-mode",
+        choices=("friction", "shape", "curve", "threshold"),
+        default="friction",
+    )
+    parser.add_argument("--ball-low-confidence-c-squeeze-threshold", type=float, default=0.0)
+    parser.add_argument("--ball-ab-friction-threshold", type=float, default=0.1464)
+    parser.add_argument(
+        "--ball-ab-friction-finger",
+        choices=("index", "middle", "thumb"),
+        default="middle",
+    )
+    parser.add_argument(
+        "--ball-ab-friction-feature",
+        choices=("last", "mean", "max", "late_slope"),
+        default="last",
+    )
+    parser.add_argument("--ball-ab-proximity-assist", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ball-ab-proximity-index-force-threshold", type=float, default=70.0)
+    parser.add_argument("--ball-ab-proximity-thumb-threshold", type=float, default=169619.0)
+    parser.add_argument(
+        "--ball-ab-proximity-a-direction",
+        choices=(">=", "<="),
+        default="<=",
+    )
+    parser.add_argument("--ball-ab-proximity-min-samples", type=float, default=5.0)
+    parser.add_argument("--ball-bc-proximity-assist", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ball-bc-proximity-thumb-threshold", type=float, default=180000.0)
+    parser.add_argument("--ball-bc-proximity-middle-threshold", type=float, default=100000.0)
     parser.add_argument("--yes", action="store_true")
     return parser
 
@@ -1509,6 +1693,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--speed must be in [0, 100]")
     if args.rate_hz <= 0:
         raise ValueError("--rate-hz must be positive")
+    if args.soft_arrival_min_speed <= 0:
+        raise ValueError("--soft-arrival-min-speed must be positive")
+    if (
+        args.soft_arrival_joint_slow_deg <= 0
+        or args.soft_arrival_pose_slow_mm <= 0
+        or args.soft_arrival_pose_slow_deg <= 0
+    ):
+        raise ValueError("soft arrival thresholds must be positive")
     if args.reach_step_deg <= 0:
         raise ValueError("--reach-step-deg must be positive")
     if args.reach_pre_j2_gain <= 0 or args.reach_post_j2_gain <= 0:
@@ -1550,8 +1742,9 @@ def validate_args(args: argparse.Namespace) -> None:
         or args.result_gesture_duration < 0
         or args.result_gesture_hold_after < 0
         or args.result_gesture_return_duration < 0
+        or args.failed_return_hold < 0
     ):
-        raise ValueError("result gesture durations must be non-negative")
+        raise ValueError("result gesture/failed return durations must be non-negative")
     if not 0.0 <= args.gamepad_deadzone < 1.0:
         raise ValueError("--gamepad-deadzone must be in [0, 1)")
     if args.gamepad_j1_speed_dps <= 0 or args.gamepad_reach_speed_dps <= 0:
@@ -1562,9 +1755,65 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--gamepad-print-interval must be non-negative")
     if args.gamepad_lead_limit_deg < 0:
         raise ValueError("--gamepad-lead-limit-deg must be non-negative")
+    if args.gamepad_pick_button < 0 or args.gamepad_stop_button < 0:
+        raise ValueError("gamepad button numbers must be non-negative")
+    if args.gamepad_pick_button == args.gamepad_stop_button:
+        raise ValueError("--gamepad-pick-button and --gamepad-stop-button must differ")
+    if args.classify_ball:
+        if not args.ball_model.exists():
+            raise ValueError(f"--ball-model does not exist: {args.ball_model}")
+        if not args.ball_visual_reference_samples.exists():
+            raise ValueError(f"--ball-visual-reference-samples does not exist: {args.ball_visual_reference_samples}")
+        if args.ball_contact_threshold < 0:
+            raise ValueError("--ball-contact-threshold must be non-negative")
+        if args.ball_hover_duration <= 0 or args.ball_hover_rate_hz <= 0:
+            raise ValueError("--ball-hover-duration/rate must be positive")
+        if args.ball_squeeze_delta <= 0 or args.ball_squeeze_duration <= 0:
+            raise ValueError("--ball-squeeze-delta/duration must be positive")
+        if args.ball_ab_squeeze_a_standard == args.ball_ab_squeeze_b_standard:
+            raise ValueError("--ball-ab-squeeze-a-standard and --ball-ab-squeeze-b-standard must differ")
+        if not 0 <= args.ball_low_confidence_c_squeeze_threshold <= 1:
+            raise ValueError("--ball-low-confidence-c-squeeze-threshold must be between 0 and 1")
+        if args.ball_ab_friction_threshold < 0:
+            raise ValueError("--ball-ab-friction-threshold must be non-negative")
+        if args.ball_ab_proximity_index_force_threshold < 0 or args.ball_ab_proximity_thumb_threshold <= 0:
+            raise ValueError("--ball-ab-proximity thresholds must be valid")
+        if args.ball_ab_proximity_min_samples < 0:
+            raise ValueError("--ball-ab-proximity-min-samples must be non-negative")
+        if args.ball_bc_proximity_thumb_threshold <= 0 or args.ball_bc_proximity_middle_threshold <= 0:
+            raise ValueError("--ball-bc-proximity thresholds must be positive")
 
 
 def config_from_args(args: argparse.Namespace) -> ClawMachineTaskConfig:
+    ball_classifier_config = None
+    if args.classify_ball:
+        ball_classifier_config = BallClassifierConfig(
+            model=args.ball_model,
+            output=args.ball_output,
+            visual_reference_samples=args.ball_visual_reference_samples,
+            contact_threshold=args.ball_contact_threshold,
+            hover_duration=args.ball_hover_duration,
+            hover_rate_hz=args.ball_hover_rate_hz,
+            squeeze_delta=args.ball_squeeze_delta,
+            squeeze_duration=args.ball_squeeze_duration,
+            ab_squeeze_test=args.ball_ab_squeeze_test,
+            ab_squeeze_threshold=args.ball_ab_squeeze_threshold,
+            ab_squeeze_a_standard=args.ball_ab_squeeze_a_standard,
+            ab_squeeze_b_standard=args.ball_ab_squeeze_b_standard,
+            ab_squeeze_mode=args.ball_ab_squeeze_mode,
+            low_confidence_c_squeeze_threshold=args.ball_low_confidence_c_squeeze_threshold,
+            ab_friction_threshold=args.ball_ab_friction_threshold,
+            ab_friction_finger=args.ball_ab_friction_finger,
+            ab_friction_feature=args.ball_ab_friction_feature,
+            ab_proximity_assist=args.ball_ab_proximity_assist,
+            ab_proximity_index_force_threshold=args.ball_ab_proximity_index_force_threshold,
+            ab_proximity_thumb_threshold=args.ball_ab_proximity_thumb_threshold,
+            ab_proximity_a_direction=args.ball_ab_proximity_a_direction,
+            ab_proximity_min_samples=args.ball_ab_proximity_min_samples,
+            bc_proximity_assist=args.ball_bc_proximity_assist,
+            bc_proximity_thumb_threshold=args.ball_bc_proximity_thumb_threshold,
+            bc_proximity_middle_threshold=args.ball_bc_proximity_middle_threshold,
+        )
     return ClawMachineTaskConfig(
         grab_z=args.grab_z,
         drop_pose=args.drop,
@@ -1580,6 +1829,11 @@ def config_from_args(args: argparse.Namespace) -> ClawMachineTaskConfig:
         vertical_duration_s=args.vertical_duration,
         transfer_duration_s=args.transfer_duration,
         return_duration_s=args.return_duration,
+        soft_arrival=args.soft_arrival,
+        soft_arrival_min_speed=args.soft_arrival_min_speed,
+        soft_arrival_joint_slow_deg=args.soft_arrival_joint_slow_deg,
+        soft_arrival_pose_slow_mm=args.soft_arrival_pose_slow_mm,
+        soft_arrival_pose_slow_deg=args.soft_arrival_pose_slow_deg,
         auto_position_tolerance_mm=args.auto_position_tolerance_mm,
         auto_rpy_tolerance_deg=args.auto_rpy_tolerance_deg,
         j1_step_deg=args.j1_step_deg,
@@ -1617,6 +1871,7 @@ def config_from_args(args: argparse.Namespace) -> ClawMachineTaskConfig:
         result_gesture_duration_s=args.result_gesture_duration,
         result_gesture_hold_after_s=args.result_gesture_hold_after,
         result_gesture_return_duration_s=args.result_gesture_return_duration,
+        failed_return_hold_s=args.failed_return_hold,
         control=args.control,
         gamepad_device=args.gamepad_device,
         gamepad_deadzone=args.gamepad_deadzone,
@@ -1629,6 +1884,9 @@ def config_from_args(args: argparse.Namespace) -> ClawMachineTaskConfig:
         gamepad_print_interval=args.gamepad_print_interval,
         gamepad_lead_limit_deg=args.gamepad_lead_limit_deg,
         gamepad_stop_reset=args.gamepad_stop_reset,
+        gamepad_pick_button=args.gamepad_pick_button,
+        gamepad_stop_button=args.gamepad_stop_button,
+        ball_classifier_config=ball_classifier_config,
     )
 
 
@@ -1652,6 +1910,8 @@ def main() -> int:
         f"{args.reach_post_j5_gain:.2f})"
     )
     print("Initial position uses joint_*.pos MOVE_J; hover/pick/drop use ee.* MOVE_P; teleop uses MOVE_J.")
+    if args.classify_ball:
+        print(f"ball classifier enabled: model={args.ball_model} output={args.ball_output}")
     if not args.yes:
         answer = input("Type YES to connect the robot and run LeRobot claw control: ").strip()
         if answer != "YES":
@@ -1676,6 +1936,7 @@ def main() -> int:
     if args.control == "gamepad":
         stop_monitor = GamepadStopMonitor(
             args.gamepad_device,
+            args.gamepad_stop_button,
             controller.request_emergency_stop,
         )
         stop_monitor.start()

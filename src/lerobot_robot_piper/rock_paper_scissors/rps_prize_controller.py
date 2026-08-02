@@ -18,6 +18,38 @@ GESTURES = ("Rock", "Paper", "Scissors")
 BEATS = {"Rock": "Scissors", "Paper": "Rock", "Scissors": "Paper"}
 
 
+def rotate_d405_ccw_90(frame: np.ndarray) -> np.ndarray:
+    return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+
+def rotate_d405_point_ccw_90(point: tuple[int, int], width: int) -> tuple[int, int]:
+    x, y = point
+    return (y, width - 1 - x)
+
+
+def rotate_d405_observation_ccw_90(observation: BallObservation, width: int) -> BallObservation:
+    return BallObservation(
+        pixel=rotate_d405_point_ccw_90(observation.pixel, width),
+        depth_m=observation.depth_m,
+        camera_xyz_m=observation.camera_xyz_m,
+        radius_px=observation.radius_px,
+        color=observation.color,
+    )
+
+
+def rotate_d405_box_ccw_90(box: tuple[int, int, int, int], width: int) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = box
+    points = [
+        rotate_d405_point_ccw_90((x0, y0), width),
+        rotate_d405_point_ccw_90((x0, y1), width),
+        rotate_d405_point_ccw_90((x1, y0), width),
+        rotate_d405_point_ccw_90((x1, y1), width),
+    ]
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
 class GameState(str, Enum):
     WAIT_GESTURE = "WAIT_GESTURE"
     SHOW_RESULT = "SHOW_RESULT"
