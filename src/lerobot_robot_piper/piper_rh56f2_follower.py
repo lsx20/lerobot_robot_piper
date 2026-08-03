@@ -11,7 +11,7 @@ from lerobot.robots.robot import Robot
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from .config_piper_rh56f2_follower import PiperRH56F2FollowerConfig
-from .piper_follower import JOINT_LIMITS_DEG, JOINT_NAMES
+from .piper_follower import JOINT_LIMITS_DEG, JOINT_NAMES, load_piper_interface_v2
 from .rh56f2_hand import HAND_NAMES, RH56F2Hand, RH56F2HandConfig
 
 logger = logging.getLogger(__name__)
@@ -167,7 +167,7 @@ class PiperRH56F2Follower(Robot):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        from piper_sdk import C_PiperInterface_V2
+        C_PiperInterface_V2 = load_piper_interface_v2()
 
         self.piper = C_PiperInterface_V2(
             self.config.can_port,

@@ -1,7 +1,9 @@
 import logging
 import math
+import sys
 import time
 from functools import cached_property
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -27,6 +29,27 @@ JOINT_LIMITS_DEG = {
 GRIPPER_RANGE_MM = (0.0, 70.0)
 
 JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
+
+
+def load_piper_interface_v2() -> Any:
+    try:
+        from piper_sdk import C_PiperInterface_V2
+
+        return C_PiperInterface_V2
+    except ImportError as first_exc:
+        sdk_root = Path.home() / "piper_sdk"
+        if sdk_root.exists() and str(sdk_root) not in sys.path:
+            sys.path.insert(0, str(sdk_root))
+        sys.modules.pop("piper_sdk", None)
+        try:
+            from piper_sdk import C_PiperInterface_V2
+
+            return C_PiperInterface_V2
+        except ImportError as second_exc:
+            raise ImportError(
+                "Cannot import piper_sdk.C_PiperInterface_V2. "
+                "If running from ~, the outer ~/piper_sdk directory may shadow the installed SDK."
+            ) from second_exc if second_exc else first_exc
 
 
 def clamp_to_limits(goal_deg: dict[str, float]) -> dict[str, float]:
@@ -108,7 +131,7 @@ class PiperFollower(Robot):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        from piper_sdk import C_PiperInterface_V2
+        C_PiperInterface_V2 = load_piper_interface_v2()
 
         self.piper = C_PiperInterface_V2(self.config.can_port)
         self.piper.ConnectPort()

@@ -42,6 +42,13 @@ try:
         BallClassifierConfig,
         HeldBallClassifier,
     )
+    from ..rock_paper_scissors.ball_tactile_classifier.common import (
+        BALL_SAFE_CLOSED as BALL_CLASSIFIER_CLOSED,
+        CLOSE_PHASES as BALL_CLASSIFIER_CLOSE_PHASES,
+        CLOSE_STEP_BY_NAME as BALL_CLASSIFIER_CLOSE_STEP_BY_NAME,
+        FINGER_NAMES as BALL_CLASSIFIER_FINGER_NAMES,
+        force_delta as ball_force_delta,
+    )
 except ImportError:  # Allow running from this directory with: python lerobot_claw.py
     package_parent = Path(__file__).resolve().parents[2]
     if str(package_parent) not in sys.path:
@@ -56,6 +63,13 @@ except ImportError:  # Allow running from this directory with: python lerobot_cl
         DEFAULT_REFERENCE_SAMPLES as DEFAULT_BALL_REFERENCE_SAMPLES,
         BallClassifierConfig,
         HeldBallClassifier,
+    )
+    from lerobot_robot_piper.rock_paper_scissors.ball_tactile_classifier.common import (
+        BALL_SAFE_CLOSED as BALL_CLASSIFIER_CLOSED,
+        CLOSE_PHASES as BALL_CLASSIFIER_CLOSE_PHASES,
+        CLOSE_STEP_BY_NAME as BALL_CLASSIFIER_CLOSE_STEP_BY_NAME,
+        FINGER_NAMES as BALL_CLASSIFIER_FINGER_NAMES,
+        force_delta as ball_force_delta,
     )
 
 
@@ -93,11 +107,25 @@ BALL_CLOSED.update(
     }
 )
 
+
+def ball_configure_hand(hand: object, speed: int, force: int) -> None:
+    hand.write_positions(
+        "speedSet",
+        {name: float(speed) for name in BALL_CLASSIFIER_FINGER_NAMES},
+    )
+    hand.write_positions(
+        "forceSet",
+        {name: float(force) for name in BALL_CLASSIFIER_FINGER_NAMES},
+    )
+    print(f"hand limits: speed={speed} force={force}")
+
 THUMB_GESTURE = dict(DEFAULT_CLOSED)
 THUMB_GESTURE.update({"thumb_bend": 1500, "thumb_swing": 1800})
 
 GRASP_HAND_SPEED = 800
 GRASP_HAND_FORCE = 600
+GRASP_MAX_FORCE_DELTA = 900.0
+GRASP_MAX_CLOSE_DURATION_S = 3.0
 
 
 class ActionRobot(Protocol):
@@ -258,7 +286,7 @@ class ClawMachineTaskConfig:
     adaptive_close_force_threshold: float = 300.0
     adaptive_close_step_deg: float = 25.0
     adaptive_close_rear_step_deg: float = 35.0
-    adaptive_close_settle_s: float = 0.05
+    adaptive_close_settle_s: float = 0.06
     grasp_mode: int = 0
     hand_settle_s: float = 0.0
     pre_grab_open_settle_s: float = 0.0
@@ -856,108 +884,138 @@ class ClawMachineController:
         self.set_hand_speed(self.config.hand_speed, "restore close speed")
         return self.set_hand_pose(BALL_CLOSED, "close ball grasp")
 
-    def close_at_grab_adaptive(self, ball_trial: object | None = None) -> bool:
+    def close_at_grab_adaptive(
+        self,
+        ball_trial: object | None = None,
+        ball_hand: object | None = None,
+    ) -> bool:
         if self.config.grasp_mode != 0:
             print(
                 f"[warn] grasp mode {self.config.grasp_mode} is disabled for the stable path; "
                 "using hand mode 0"
             )
-        return self._close_at_grab_fixed(ball_trial)
+        return self._close_at_grab_fixed(ball_trial, ball_hand)
 
-    def _close_at_grab_fixed(self, ball_trial: object | None = None) -> bool:
-        self.set_hand_speed(GRASP_HAND_SPEED, "adaptive close speed")
-        self.set_hand_force(GRASP_HAND_FORCE, "adaptive close force")
+    def _close_at_grab_fixed(
+        self,
+        ball_trial: object | None = None,
+        ball_hand: object | None = None,
+    ) -> bool:
+        if ball_hand is not None:
+            ball_configure_hand(ball_hand, GRASP_HAND_SPEED, GRASP_HAND_FORCE)
+        else:
+            self.set_hand_speed(GRASP_HAND_SPEED, "adaptive close speed")
+            self.set_hand_force(GRASP_HAND_FORCE, "adaptive close force")
         baseline_obs = self.observation()
         self._close_peak_names = set()
         self._close_peak_active_count = 0
         current_target = {
             name: float(baseline_obs[f"hand.{name}.pos"])
-            for name in HAND_NAMES
+            for name in BALL_CLASSIFIER_FINGER_NAMES
         }
-
-        phases = [
-            (
-                "little + thumb swing",
-                {"little": 1200.0, "thumb_swing": 900.0},
-                {"little": 120.0, "thumb_swing": 150.0},
-                0.00,
-            ),
-            (
-                "ring + thumb bend",
-                {"ring": 1220.0, "thumb_bend": 1350.0},
-                {"ring": 70.0, "thumb_bend": 50.0},
-                0.15,
-            ),
-            (
-                "middle + index",
-                {"middle": 1350.0, "index": 1350.0},
-                {"middle": 60.0, "index": 60.0},
-                0.30,
-            ),
-        ]
+        contacted: set[str] = set()
+        contact_threshold = (
+            self.ball_classifier.config.contact_threshold
+            if self.ball_classifier is not None
+            else self.config.held_force_threshold
+        )
         print(
-            "Ball grasp close: overlapping phases "
-            "little+thumb_swing -> ring+thumb_bend -> middle+index; "
-            "offsets=0.00/0.15/0.30s, speed=800, thumb_swing target=900"
+            "Ball grasp close: predict_live rhythm "
+            "phases=little_thumb/ring_thumb/middle_index, "
+            "offsets=0.00/0.15/0.30s, step_settle=0.06s, speed=800"
         )
 
         started_at = time.monotonic()
-        started_phases: set[str] = set()
-        completed_phases: set[str] = set()
-        while len(completed_phases) < len(phases):
+        while True:
             if self.emergency_stop_requested():
                 self.hold_current_position()
                 return False
 
-            elapsed = time.monotonic() - started_at
-            action: RobotAction = {}
-            active_names: list[str] = []
-            for phase_name, phase_goals, phase_steps, phase_offset in phases:
-                if elapsed < phase_offset or phase_name in completed_phases:
+            elapsed_s = time.monotonic() - started_at
+            action_values: dict[str, float] = {}
+            for _, names, offset_s in BALL_CLASSIFIER_CLOSE_PHASES:
+                if elapsed_s < offset_s:
                     continue
-                if phase_name not in started_phases:
-                    started_phases.add(phase_name)
-                    print(f"Grasp phase started: {phase_name}")
-                remaining = False
-                for name, goal in phase_goals.items():
+                for name in names:
+                    goal = BALL_CLASSIFIER_CLOSED[name]
                     if current_target[name] > goal:
-                        remaining = True
                         current_target[name] = max(
-                            goal, current_target[name] - phase_steps[name]
+                            goal,
+                            current_target[name] - BALL_CLASSIFIER_CLOSE_STEP_BY_NAME[name],
                         )
-                        action[f"hand.{name}.pos"] = current_target[name]
-                        active_names.append(name)
-                if not remaining:
-                    completed_phases.add(phase_name)
-                    print(f"Grasp phase complete: {phase_name}")
+                        action_values[name] = current_target[name]
 
-            if action:
-                self.robot.send_action(action)
-                obs = self.observation()
-                if self.ball_classifier is not None and ball_trial is not None:
-                    self.ball_classifier.record_observation_frame(ball_trial, obs, started_at)
-                close_active_names = [
-                    name
-                    for name in HAND_NAMES
-                    if abs(float(obs.get(f"hand.{name}.force", 0.0)))
-                    >= self.config.adaptive_close_force_threshold
-                ]
-                self._close_peak_names.update(close_active_names)
-                self._close_peak_active_count = len(self._close_peak_names)
-                details = []
-                for name in active_names:
-                    actual = float(obs[f"hand.{name}.pos"])
-                    force = float(obs[f"hand.{name}.force"])
-                    details.append(
-                        f"{name}:angle={actual:.0f}/{current_target[name]:.0f} "
-                        f"force={force:.0f}"
+            if action_values:
+                if ball_hand is not None and hasattr(ball_hand, "set_angles"):
+                    ball_hand.set_angles(action_values)
+                else:
+                    self.robot.send_action(
+                        {f"hand.{name}.pos": value for name, value in action_values.items()}
                     )
-                print("  " + " | ".join(details))
-
             if not self.wait_with_stop(self.config.adaptive_close_settle_s):
                 self.hold_current_position()
                 return False
 
+            frame = None
+            if self.ball_classifier is not None and ball_trial is not None and ball_hand is not None:
+                try:
+                    frame = self.ball_classifier.record_grasp_frame(ball_hand, ball_trial, started_at)
+                except Exception as exc:
+                    print(f"\n[warn] grasp frame read failed: {exc}")
+            if frame is not None:
+                force_text = []
+                for name in BALL_CLASSIFIER_FINGER_NAMES:
+                    delta = ball_force_delta(frame.forces, ball_trial.baseline_forces, name)
+                    force_text.append(f"{name}={delta:.0f}")
+                    if delta >= contact_threshold:
+                        contacted.add(name)
+                max_delta = max(
+                    ball_force_delta(frame.forces, ball_trial.baseline_forces, name)
+                    for name in BALL_CLASSIFIER_FINGER_NAMES
+                )
+                print(
+                    "\rclose contact "
+                    f"{len(contacted)}/6 "
+                    + " ".join(force_text),
+                    end="",
+                    flush=True,
+                )
+            else:
+                obs = self.observation()
+                force_text = []
+                for name in BALL_CLASSIFIER_FINGER_NAMES:
+                    force = abs(float(obs.get(f"hand.{name}.force", 0.0)))
+                    force_text.append(f"{name}={force:.0f}")
+                    if force >= contact_threshold:
+                        contacted.add(name)
+                max_delta = max(
+                    abs(float(obs.get(f"hand.{name}.force", 0.0)))
+                    for name in BALL_CLASSIFIER_FINGER_NAMES
+                )
+                print(
+                    "\rclose contact "
+                    f"{len(contacted)}/6 "
+                    + " ".join(force_text),
+                    end="",
+                    flush=True,
+                )
+
+            self._close_peak_names.update(contacted)
+            self._close_peak_active_count = len(self._close_peak_names)
+            if max_delta >= GRASP_MAX_FORCE_DELTA:
+                print("\nmax close force reached; stopping close.")
+                break
+            all_goals_reached = all(
+                current_target[name] <= BALL_CLASSIFIER_CLOSED[name]
+                for name in BALL_CLASSIFIER_FINGER_NAMES
+            )
+            if elapsed_s >= GRASP_MAX_CLOSE_DURATION_S:
+                print(f"\nmax close duration reached: {GRASP_MAX_CLOSE_DURATION_S:.2f}s")
+                break
+            if all_goals_reached:
+                break
+
+        print()
         print(
             "Ball grasp close complete; fixed sequence finished. "
             f"close_peak={self._close_peak_active_count}/6 "
@@ -1201,7 +1259,7 @@ class ClawMachineController:
                     print("ball classifier: baseline captured before closing.")
                 except Exception as exc:
                     print(f"[warn] ball classifier baseline failed: {exc}")
-        if not self.close_at_grab_adaptive(ball_trial):
+        if not self.close_at_grab_adaptive(ball_trial, ball_hand):
             print("[warn] adaptive close failed")
             return False
         print("Grasp close complete; lifting immediately to check hover.")
@@ -1593,7 +1651,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-close-force-threshold", type=float, default=300.0)
     parser.add_argument("--adaptive-close-step-deg", type=float, default=25.0)
     parser.add_argument("--adaptive-close-rear-step-deg", type=float, default=35.0)
-    parser.add_argument("--adaptive-close-settle", type=float, default=0.05)
+    parser.add_argument("--adaptive-close-settle", type=float, default=0.06)
     parser.add_argument("--grasp-mode", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--hand-settle", type=float, default=0.0)
     parser.add_argument("--pre-grab-open-settle", type=float, default=0.0)

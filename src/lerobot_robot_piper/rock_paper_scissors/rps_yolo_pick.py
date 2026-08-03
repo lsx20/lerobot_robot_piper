@@ -366,6 +366,8 @@ class D405YoloTargeter:
             camera_point = np.array([*stable.camera_xyz_m, 1.0])
             base_point = base_tool @ self.tool_camera @ camera_point
             base_xyz = [float(value) for value in base_point[:3]]
+            base_xyz[0] += self.args.grab_x_offset
+            base_xyz[1] += self.args.grab_y_offset
             if self.args.target_z_mode == "fixed":
                 base_xyz[2] = self.args.fixed_grab_z
             else:
@@ -867,6 +869,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="fixed uses --fixed-grab-z; vision uses calibrated Z plus --grab-z-offset",
     )
     parser.add_argument("--fixed-grab-z", type=float, default=FIXED_GRAB_XYZ_M[2])
+    parser.add_argument("--grab-x-offset", type=float, default=0.0, help="metres added to vision target X before approach/grab")
+    parser.add_argument("--grab-y-offset", type=float, default=0.0, help="metres added to vision target Y before approach/grab")
     parser.add_argument("--grab-z-offset", type=float, default=0.0)
     parser.add_argument("--min-grab-z", type=float, default=0.15)
     parser.add_argument("--max-grab-z", type=float, default=0.35)
@@ -1071,6 +1075,7 @@ def main() -> int:
             print(f"fixed grab Z(m): {args.fixed_grab_z}")
         else:
             print(f"vision grab Z offset(m): {args.grab_z_offset}")
+        print(f"grab XY offset(m): ({args.grab_x_offset}, {args.grab_y_offset})")
         print(f"grab Z clamp(m): [{args.min_grab_z}, {args.max_grab_z}]")
         if args.hover_only:
             print("hover-only: no descent and no gripper close after D405 target acquisition.")
