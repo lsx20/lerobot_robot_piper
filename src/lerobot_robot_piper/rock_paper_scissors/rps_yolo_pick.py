@@ -29,6 +29,9 @@ from lerobot_robot_piper.claw_machine.lerobot_claw import (  # noqa: E402
     parse_joint_degrees,
     pose_from_values,
 )
+from lerobot_robot_piper.rock_paper_scissors.ball_tactile_classifier.claw_integration import (  # noqa: E402
+    BallClassifierConfig,
+)
 from lerobot_robot_piper.config_piper_rh56f2_follower import (  # noqa: E402
     PiperRH56F2FollowerConfig,
 )
@@ -48,6 +51,19 @@ from lerobot_robot_piper.rock_paper_scissors.solve_eye_hand_calibration import (
     rpy_to_matrix,
 )
 from lerobot_robot_piper.rock_paper_scissors.test_yolo_d405_ball import depth_at_box  # noqa: E402
+from lerobot_robot_piper.rock_paper_scissors.eye_to_hand_calibration.homography_tabletop_runtime import (  # noqa: E402
+    PixelDetection,
+    apply_homography,
+    best_ball_pixel,
+    draw_preview,
+    load_homography,
+    median_detection,
+    update_stable,
+)
+from lerobot_robot_piper.rock_paper_scissors.eye_to_hand_calibration.planar_grasp_geometry import (  # noqa: E402
+    radial_flange_xy,
+    solve_planar_joint_target,
+)
 
 
 GESTURES = ("rock", "paper", "scissors")
@@ -55,11 +71,19 @@ BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
 DISPLAY = {"rock": "Rock", "paper": "Paper", "scissors": "Scissors"}
 CAMERA_GESTURES = {"Rock": "rock", "Paper": "paper", "Scissors": "scissors"}
 DEFAULT_D435I_SERIAL = "261722071542"
-DEFAULT_D405_SERIAL = "260322279862"
+DEFAULT_FIXED_D405_SERIAL = "315122271151"
+DEFAULT_D405_SERIAL = DEFAULT_FIXED_D405_SERIAL
 DEFAULT_GESTURE_MODEL = Path(__file__).with_name("gesture_recognizer.task")
 DEFAULT_CALIBRATION = Path(__file__).with_name("eye_hand_calibration_yolo11x_clean2.json")
+DEFAULT_HOMOGRAPHY_CALIBRATION = Path(__file__).with_name("eye_to_hand_calibration") / "homography_position_calibration.json"
 DEFAULT_BALL_MODEL = Path(__file__).with_name("yolo11x.pt")
+DEFAULT_HOMOGRAPHY_BALL_MODEL = Path(__file__).with_name("yolo26n.pt")
+BALL_CLASSIFIER_DIR = Path(__file__).with_name("ball_tactile_classifier")
+DEFAULT_TACTILE_MODEL = BALL_CLASSIFIER_DIR / "model.json"
+DEFAULT_TACTILE_OUTPUT = BALL_CLASSIFIER_DIR / "live_predictions.csv"
+DEFAULT_TACTILE_REFERENCE_SAMPLES = BALL_CLASSIFIER_DIR / "samples.csv"
 FIXED_GRAB_XYZ_M = (0.30455, 0.02575, 0.25000)
+DEFAULT_DROP_POSE = [-185.449, 434.149, 135.053, 68.125, 72.173, 172.599]
 DEFAULT_APPROACH_HEIGHT_M = 0.08
 DEFAULT_RPS_JOINTS = [-1.391, 53.150, -56.325, 2.544, -17.309, 101.959]
 
@@ -120,6 +144,16 @@ def parse_xyz(value: str) -> list[float]:
         return [float(part) for part in parts]
     except ValueError as exc:
         raise argparse.ArgumentTypeError("X,Y,Z must be numbers") from exc
+
+
+def parse_pose_values(value: str) -> list[float]:
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 6:
+        raise argparse.ArgumentTypeError("expected X,Y,Z,RX,RY,RZ in mm/deg")
+    try:
+        return [float(part) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("pose values must be numbers") from exc
 
 
 def piper_pose_to_base_tool(current_pose: dict[str, float]) -> np.ndarray:
@@ -394,6 +428,179 @@ class D405YoloTargeter:
         return None
 
 
+@dataclass(frozen=True)
+class HomographyPlanarTarget:
+    confidence: float
+    pixel: tuple[int, int]
+    ball_xy_m: tuple[float, float]
+    flange_xy_m: tuple[float, float]
+    theta_deg: float
+    joints: list[float]
+    fk_error_mm: float
+
+
+class D405HomographyPlanarTargeter:
+    def __init__(self, args: argparse.Namespace):
+        try:
+            import pyrealsense2 as rs
+        except ImportError as exc:
+            raise RuntimeError("pyrealsense2 is required for D405 homography targeting") from exc
+
+        self.rs = rs
+        self.args = args
+        self.homography = load_homography(args.homography_calibration)
+        self.model = YOLO(str(args.homography_ball_model))
+        self.ball_class_ids = {
+            class_id
+            for class_id, name in self.model.names.items()
+            if str(name).lower() == "sports ball"
+        }
+        if not self.ball_class_ids:
+            raise RuntimeError(f"YOLO model has no sports ball class: {self.model.names}")
+
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        if args.ball_serial:
+            self.config.enable_device(args.ball_serial)
+        self.config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
+        self.started = False
+
+    def start(self) -> None:
+        if self.started:
+            return
+        self.pipeline.start(self.config)
+        self.started = True
+
+    def stop(self) -> None:
+        if self.started:
+            self.pipeline.stop()
+            self.started = False
+
+    def _prediction_kwargs(self) -> dict[str, object]:
+        kwargs: dict[str, object] = {
+            "conf": self.args.homography_conf,
+            "imgsz": self.args.homography_imgsz,
+            "verbose": False,
+        }
+        if self.args.ball_device:
+            kwargs["device"] = self.args.ball_device
+        return kwargs
+
+    def read_detection(self) -> tuple[np.ndarray, PixelDetection | None]:
+        frames = self.pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+        if not color_frame:
+            return np.zeros((self.args.height, self.args.width, 3), dtype=np.uint8), None
+        color = np.asanyarray(color_frame.get_data())
+        result = self.model.predict(color, **self._prediction_kwargs())[0]
+        detection = best_ball_pixel(
+            result,
+            self.ball_class_ids,
+            self.args.ball_roi,
+            self.args.width,
+            self.args.height,
+        )
+        return color, detection
+
+    def warmup(self, duration_s: float) -> None:
+        deadline = time.monotonic() + max(0.0, duration_s)
+        while time.monotonic() < deadline:
+            self.pipeline.wait_for_frames()
+
+    def prime(self) -> None:
+        color, detection = self.read_detection()
+        target_xy = apply_homography(self.homography, detection.pixel) if detection is not None else None
+        if not self.args.no_window:
+            cv2.imshow(
+                "D405 homography tabletop target",
+                draw_preview(color, detection, target_xy, 1 if detection else 0, self.args.ball_stable_frames),
+            )
+            cv2.waitKey(1)
+
+    def acquire_target(self) -> HomographyPlanarTarget | None:
+        detections: list[PixelDetection] = []
+        deadline = time.monotonic() + self.args.ball_timeout
+        last_status_t = 0.0
+        window = "D405 homography tabletop target"
+        if not self.args.no_window:
+            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+
+        print(f"Refreshing D405 frames for {self.args.ball_warmup:.1f}s before homography target.")
+        self.warmup(self.args.ball_warmup)
+
+        while time.monotonic() < deadline:
+            color, detection = self.read_detection()
+            detections = update_stable(
+                detections,
+                detection,
+                self.args.ball_stable_frames,
+                self.args.ball_max_pixel_jump,
+            )
+            stable = median_detection(detections) if len(detections) >= self.args.ball_stable_frames else None
+            ball_xy_m = apply_homography(self.homography, stable.pixel) if stable is not None else None
+
+            now = time.monotonic()
+            if now - last_status_t >= 1.0:
+                if detection is None:
+                    print(
+                        "D405 homography YOLO: no ball candidate "
+                        f"(conf>={self.args.homography_conf}, roi={self.args.ball_roi})"
+                    )
+                else:
+                    print(
+                        "D405 homography YOLO: "
+                        f"conf={detection.confidence:.3f} pixel={detection.pixel} "
+                        f"stable={len(detections)}/{self.args.ball_stable_frames}"
+                    )
+                last_status_t = now
+
+            if not self.args.no_window:
+                preview_xy = ball_xy_m
+                cv2.imshow(
+                    window,
+                    draw_preview(color, stable or detection, preview_xy, len(detections), self.args.ball_stable_frames),
+                )
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    return None
+
+            if stable is None or ball_xy_m is None:
+                continue
+
+            flange_xy_m, theta_deg = radial_flange_xy(ball_xy_m, self.args.radial_offset_mm)
+            joints, fk, error_mm = solve_planar_joint_target(
+                flange_xy_m,
+                self.args.lift_z * 1000.0,
+                self.args.planar_j4_deg,
+                self.args.planar_j6_deg,
+                self.args.planar_j5_seed_deg,
+            )
+            fk_xyz = fk[:3, 3]
+            print(
+                "homography target: "
+                f"pixel={stable.pixel} conf={stable.confidence:.3f} "
+                f"ball_xy=({ball_xy_m[0]:.4f},{ball_xy_m[1]:.4f})m "
+                f"theta={theta_deg:.2f}deg radial_offset={self.args.radial_offset_mm:.1f}mm"
+            )
+            print(
+                "planar_joint: "
+                + ",".join(f"{value:.3f}" for value in joints)
+                + f" fk_xyz=({fk_xyz[0]:.4f},{fk_xyz[1]:.4f},{fk_xyz[2]:.4f})m "
+                + f"error={error_mm:.2f}mm"
+            )
+            return HomographyPlanarTarget(
+                confidence=stable.confidence,
+                pixel=stable.pixel,
+                ball_xy_m=ball_xy_m,
+                flange_xy_m=flange_xy_m,
+                theta_deg=theta_deg,
+                joints=joints,
+                fk_error_mm=error_mm,
+            )
+
+        print(f"[warn] no stable D405 homography ball target within {self.args.ball_timeout:.1f}s")
+        return None
+
+
 def choose_system_gesture(
     player: str,
     player_win_probability: float,
@@ -482,20 +689,57 @@ def disconnect_without_disable_prompt(robot: PiperRH56F2Follower) -> None:
     robot._is_connected = False
 
 
+def status_hex(value: object) -> str:
+    try:
+        return f"0x{int(value):x}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def print_raw_status(robot: PiperRH56F2Follower, label: str) -> None:
     if robot.piper is None:
         return
     status = robot.piper.GetArmStatus().arm_status
     enable = list(robot.piper.GetArmEnableStatus())
     print(
-        f"{label}: ctrl=0x{int(status.ctrl_mode):x} "
-        f"mode=0x{int(status.mode_feed):x} "
-        f"arm=0x{int(status.arm_status):x} "
+        f"{label}: ctrl={status_hex(status.ctrl_mode)} "
+        f"mode={status_hex(status.mode_feed)} "
+        f"arm={status_hex(status.arm_status)} "
         f"enable={enable}"
     )
 
 
 def make_controller(args: argparse.Namespace) -> tuple[PiperRH56F2Follower, ClawMachineController]:
+    ball_classifier_config = None
+    if args.classify_ball:
+        ball_classifier_config = BallClassifierConfig(
+            model=args.ball_tactile_model,
+            output=args.ball_tactile_output,
+            visual_reference_samples=args.ball_tactile_visual_reference_samples,
+            contact_threshold=args.ball_contact_threshold,
+            hover_duration=args.ball_hover_duration,
+            hover_rate_hz=args.ball_hover_rate_hz,
+            squeeze_delta=args.ball_squeeze_delta,
+            squeeze_duration=args.ball_squeeze_duration,
+            ab_squeeze_test=args.ball_ab_squeeze_test,
+            ab_squeeze_threshold=args.ball_ab_squeeze_threshold,
+            ab_squeeze_a_standard=args.ball_ab_squeeze_a_standard,
+            ab_squeeze_b_standard=args.ball_ab_squeeze_b_standard,
+            ab_squeeze_mode=args.ball_ab_squeeze_mode,
+            low_confidence_c_squeeze_threshold=args.ball_low_confidence_c_squeeze_threshold,
+            ab_friction_threshold=args.ball_ab_friction_threshold,
+            ab_friction_finger=args.ball_ab_friction_finger,
+            ab_friction_feature=args.ball_ab_friction_feature,
+            ab_proximity_assist=args.ball_ab_proximity_assist,
+            ab_proximity_index_force_threshold=args.ball_ab_proximity_index_force_threshold,
+            ab_proximity_thumb_threshold=args.ball_ab_proximity_thumb_threshold,
+            ab_proximity_a_direction=args.ball_ab_proximity_a_direction,
+            ab_proximity_min_samples=args.ball_ab_proximity_min_samples,
+            bc_proximity_assist=args.ball_bc_proximity_assist,
+            bc_proximity_thumb_threshold=args.ball_bc_proximity_thumb_threshold,
+            bc_proximity_middle_threshold=args.ball_bc_proximity_middle_threshold,
+            notes="rps_homography_grasp",
+        )
     robot = PiperRH56F2Follower(
         PiperRH56F2FollowerConfig(
             can_port=args.can,
@@ -529,6 +773,10 @@ def make_controller(args: argparse.Namespace) -> tuple[PiperRH56F2Follower, Claw
             auto_position_tolerance_mm=args.position_tolerance_mm,
             auto_rpy_tolerance_deg=args.rpy_tolerance_deg,
             result_gesture=False,
+            drop_pose=pose_from_values(list(args.drop_pose)),
+            transfer_duration_s=args.transfer_duration,
+            drop_open_settle_s=args.drop_open_settle,
+            ball_classifier_config=ball_classifier_config,
         ),
     )
     return robot, controller
@@ -793,6 +1041,72 @@ def run_yolo_pick(
     return True
 
 
+def run_homography_planar_pick(
+    controller: ClawMachineController,
+    targeter: D405HomographyPlanarTargeter,
+    args: argparse.Namespace,
+) -> bool:
+    print("Moving to claw-machine start joints before homography target acquisition.")
+    if not controller.move_joints_for(
+        list(DEFAULT_START_JOINTS),
+        args.speed,
+        args.start_duration,
+        "start MOVE_J",
+    ):
+        return False
+
+    print("Acquiring stable fixed-D405 homography ball target.")
+    target = targeter.acquire_target()
+    if target is None:
+        return False
+
+    if target.fk_error_mm > args.max_planar_fk_error_mm:
+        print(
+            f"[warn] planar FK error {target.fk_error_mm:.2f}mm "
+            f"> --max-planar-fk-error-mm {args.max_planar_fk_error_mm:.2f}mm"
+        )
+        return False
+
+    print("Moving planar joints to radial flange hover above ball.")
+    if not controller.move_joints_until_reached(
+        target.joints,
+        args.speed,
+        args.planar_duration,
+        args.planar_hold_after_reached,
+        "planar target MOVE_J",
+        tolerance_deg=args.planar_joint_tolerance_deg,
+    ):
+        return False
+
+    hover_pose = controller.current_pose()
+    grab_pose = dict(hover_pose)
+    grab_pose["ee.z"] = args.fixed_grab_z * 1000.0
+    lift_pose = dict(hover_pose)
+    lift_pose["ee.z"] = max(hover_pose["ee.z"], args.lift_z * 1000.0)
+    drop_pose = pose_from_values(list(args.drop_pose))
+
+    print("Running homography planar pick cycle")
+    print(f"  hover: {controller.format_pose(hover_pose)}")
+    print(f"  grab:  {controller.format_pose(grab_pose)}")
+    print(f"  lift:  {controller.format_pose(lift_pose)}")
+    print(f"  drop:  {controller.format_pose(drop_pose)}")
+    print(f"  start: {controller.format_pose(pose_from_values(list(DEFAULT_START_POSE)))}")
+
+    previous_lift_z = controller.config.lift_z
+    previous_grab_z = controller.config.grab_z
+    try:
+        controller.config.grab_z = grab_pose["ee.z"]
+        controller.config.lift_z = lift_pose["ee.z"]
+        return controller.run_pick_cycle(
+            pose_from_values(list(DEFAULT_START_POSE)),
+            hover_pose,
+            drop_pose,
+        )
+    finally:
+        controller.config.lift_z = previous_lift_z
+        controller.config.grab_z = previous_grab_z
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--can", default="can0")
@@ -805,6 +1119,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-duration", type=float, default=20.0)
     parser.add_argument("--hover-duration", type=float, default=8.0)
     parser.add_argument("--vertical-duration", type=float, default=4.0)
+    parser.add_argument("--transfer-duration", type=float, default=8.0)
     parser.add_argument("--return-duration", type=float, default=8.0)
     parser.add_argument("--gesture-serial", default=DEFAULT_D435I_SERIAL)
     parser.add_argument("--gesture-model", type=Path, default=DEFAULT_GESTURE_MODEL)
@@ -822,9 +1137,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--print-vision", action="store_true")
     parser.add_argument(
         "--pick-source",
-        choices=("yolo", "fixed"),
+        choices=("yolo", "fixed", "homography"),
         default="yolo",
-        help="yolo uses D405+YOLO+hand-eye; fixed keeps the old --grab-xyz workflow",
+        help="yolo uses D405+YOLO+hand-eye; homography uses fixed D405 tabletop XY; fixed keeps old --grab-xyz",
     )
     parser.add_argument("--grab-xyz", type=parse_xyz, default=list(FIXED_GRAB_XYZ_M))
     parser.add_argument(
@@ -869,6 +1184,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="fixed uses --fixed-grab-z; vision uses calibrated Z plus --grab-z-offset",
     )
     parser.add_argument("--fixed-grab-z", type=float, default=FIXED_GRAB_XYZ_M[2])
+    parser.add_argument("--homography-calibration", type=Path, default=DEFAULT_HOMOGRAPHY_CALIBRATION)
+    parser.add_argument("--homography-ball-model", type=Path, default=DEFAULT_HOMOGRAPHY_BALL_MODEL)
+    parser.add_argument("--homography-conf", type=float, default=0.05)
+    parser.add_argument("--homography-imgsz", type=int, default=960)
+    parser.add_argument("--radial-offset-mm", type=float, default=45.0)
+    parser.add_argument("--planar-j4-deg", type=float, default=0.0)
+    parser.add_argument("--planar-j6-deg", type=float, default=0.0)
+    parser.add_argument("--planar-j5-seed-deg", type=float, default=13.0)
+    parser.add_argument("--planar-duration", type=float, default=5.0)
+    parser.add_argument("--planar-joint-tolerance-deg", type=float, default=1.5)
+    parser.add_argument("--planar-hold-after-reached", type=float, default=0.15)
+    parser.add_argument("--max-planar-fk-error-mm", type=float, default=3.0)
+    parser.add_argument("--lift-z", type=float, default=0.285, help="metres used as hover/lift Z after homography grasp")
+    parser.add_argument("--drop-pose", type=parse_pose_values, default=list(DEFAULT_DROP_POSE))
     parser.add_argument("--grab-x-offset", type=float, default=0.0, help="metres added to vision target X before approach/grab")
     parser.add_argument("--grab-y-offset", type=float, default=0.0, help="metres added to vision target Y before approach/grab")
     parser.add_argument("--grab-z-offset", type=float, default=0.0)
@@ -912,9 +1241,57 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pre-grab-open-speed", type=int, default=2500)
     parser.add_argument("--pre-grab-open-settle", type=float, default=1.0)
     parser.add_argument("--hand-settle", type=float, default=1.0)
+    parser.add_argument("--drop-open-settle", type=float, default=4.0)
     parser.add_argument("--position-tolerance-mm", type=float, default=2.0)
     parser.add_argument("--rpy-tolerance-deg", type=float, default=2.0)
     parser.add_argument("--check-held", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--classify-ball",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="after lift hover, update the same LIVEBOARD flow as predict_live.py",
+    )
+    parser.add_argument("--ball-tactile-model", type=Path, default=DEFAULT_TACTILE_MODEL)
+    parser.add_argument("--ball-tactile-output", type=Path, default=DEFAULT_TACTILE_OUTPUT)
+    parser.add_argument("--ball-tactile-visual-reference-samples", type=Path, default=DEFAULT_TACTILE_REFERENCE_SAMPLES)
+    parser.add_argument("--ball-contact-threshold", type=float, default=70.0)
+    parser.add_argument("--ball-hover-duration", type=float, default=5.0)
+    parser.add_argument("--ball-hover-rate-hz", type=float, default=10.0)
+    parser.add_argument("--ball-squeeze-delta", type=float, default=40.0)
+    parser.add_argument("--ball-squeeze-duration", type=float, default=3.0)
+    parser.add_argument("--ball-ab-squeeze-test", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ball-ab-squeeze-threshold", type=float, default=190.0)
+    parser.add_argument("--ball-ab-squeeze-a-standard", type=float, default=238.0)
+    parser.add_argument("--ball-ab-squeeze-b-standard", type=float, default=142.5)
+    parser.add_argument(
+        "--ball-ab-squeeze-mode",
+        choices=("friction", "shape", "curve", "threshold"),
+        default="friction",
+    )
+    parser.add_argument("--ball-low-confidence-c-squeeze-threshold", type=float, default=0.0)
+    parser.add_argument("--ball-ab-friction-threshold", type=float, default=0.1464)
+    parser.add_argument(
+        "--ball-ab-friction-finger",
+        choices=("index", "middle", "thumb"),
+        default="middle",
+    )
+    parser.add_argument(
+        "--ball-ab-friction-feature",
+        choices=("last", "mean", "max", "late_slope"),
+        default="last",
+    )
+    parser.add_argument("--ball-ab-proximity-assist", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ball-ab-proximity-index-force-threshold", type=float, default=70.0)
+    parser.add_argument("--ball-ab-proximity-thumb-threshold", type=float, default=169619.0)
+    parser.add_argument(
+        "--ball-ab-proximity-a-direction",
+        choices=(">=", "<="),
+        default="<=",
+    )
+    parser.add_argument("--ball-ab-proximity-min-samples", type=float, default=5.0)
+    parser.add_argument("--ball-bc-proximity-assist", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ball-bc-proximity-thumb-threshold", type=float, default=180000.0)
+    parser.add_argument("--ball-bc-proximity-middle-threshold", type=float, default=100000.0)
     parser.add_argument(
         "--ready-hand-after-return",
         choices=("rock", "paper", "scissors"),
@@ -934,7 +1311,7 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace) -> None:
     if not 0 <= args.speed <= 100:
         raise SystemExit("--speed must be between 0 and 100")
-    for name in ("rate_hz", "start_duration", "hover_duration", "vertical_duration", "return_duration"):
+    for name in ("rate_hz", "start_duration", "hover_duration", "vertical_duration", "transfer_duration", "return_duration"):
         if getattr(args, name) <= 0:
             raise SystemExit(f"--{name.replace('_', '-')} must be positive")
     if args.width <= 0 or args.height <= 0 or args.fps <= 0:
@@ -956,6 +1333,19 @@ def validate_args(args: argparse.Namespace) -> None:
             raise SystemExit(f"--calibration does not exist: {args.calibration}")
         if not args.ball_model.exists():
             raise SystemExit(f"--ball-model does not exist: {args.ball_model}")
+    if args.pick_source == "homography":
+        if not args.homography_calibration.exists():
+            raise SystemExit(f"--homography-calibration does not exist: {args.homography_calibration}")
+        if not args.homography_ball_model.exists():
+            raise SystemExit(f"--homography-ball-model does not exist: {args.homography_ball_model}")
+        if args.radial_offset_mm < 0:
+            raise SystemExit("--radial-offset-mm must be non-negative")
+        if args.planar_duration <= 0 or args.planar_joint_tolerance_deg <= 0:
+            raise SystemExit("--planar-duration and --planar-joint-tolerance-deg must be positive")
+        if args.max_planar_fk_error_mm < 0:
+            raise SystemExit("--max-planar-fk-error-mm must be non-negative")
+        if args.lift_z <= 0:
+            raise SystemExit("--lift-z must be positive")
     if not 0.0 <= args.ball_conf <= 1.0:
         raise SystemExit("--ball-conf must be in [0, 1]")
     if args.ball_imgsz <= 0:
@@ -974,6 +1364,22 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--refine-max-xy must be positive")
     if args.refine_duration <= 0:
         raise SystemExit("--refine-duration must be positive")
+    if args.drop_open_settle < 0 or args.hand_settle < 0 or args.pre_grab_open_settle < 0:
+        raise SystemExit("hand settle times must be non-negative")
+    if args.classify_ball:
+        if not args.ball_tactile_model.exists():
+            raise SystemExit(f"--ball-tactile-model does not exist: {args.ball_tactile_model}")
+        if not args.ball_tactile_visual_reference_samples.exists():
+            raise SystemExit(
+                f"--ball-tactile-visual-reference-samples does not exist: "
+                f"{args.ball_tactile_visual_reference_samples}"
+            )
+        if args.ball_contact_threshold < 0:
+            raise SystemExit("--ball-contact-threshold must be non-negative")
+        if args.ball_hover_duration <= 0 or args.ball_hover_rate_hz <= 0:
+            raise SystemExit("--ball-hover-duration/rate must be positive")
+        if args.ball_squeeze_delta <= 0 or args.ball_squeeze_duration <= 0:
+            raise SystemExit("--ball-squeeze-delta/duration must be positive")
 
 
 def read_player_gesture() -> str | None:
@@ -1066,6 +1472,14 @@ def main() -> int:
     if args.pick_source == "fixed":
         print(f"grab XYZ(m):     {tuple(args.grab_xyz)}")
         print(f"approach XYZ(m): {tuple(approach_xyz_from_args(args))}")
+    elif args.pick_source == "homography":
+        print(f"D405 serial: {args.ball_serial or 'any RealSense color camera'}")
+        print(f"YOLO model: {args.homography_ball_model}")
+        print(f"homography calibration: {args.homography_calibration}")
+        print(f"fixed grab Z(m): {args.fixed_grab_z}")
+        print(f"lift Z(m): {args.lift_z}")
+        print(f"radial offset(mm): {args.radial_offset_mm}")
+        print(f"drop pose(mm/deg): {','.join(f'{value:.3f}' for value in args.drop_pose)}")
     else:
         print(f"D405 serial: {args.ball_serial or 'any RealSense depth camera'}")
         print(f"YOLO model: {args.ball_model}")
@@ -1079,6 +1493,11 @@ def main() -> int:
         print(f"grab Z clamp(m): [{args.min_grab_z}, {args.max_grab_z}]")
         if args.hover_only:
             print("hover-only: no descent and no gripper close after D405 target acquisition.")
+    if args.classify_ball:
+        dashboard = args.ball_tactile_output.with_name("live_dashboard.html")
+        print(f"tactile model: {args.ball_tactile_model}")
+        print(f"tactile LIVEBOARD csv: {args.ball_tactile_output}")
+        print(f"tactile LIVEBOARD html: {dashboard}")
     print(f"RPS joints: {fmt_joints(args.rps_joints)}")
     print(f"claw start joints: {fmt_joints(list(DEFAULT_START_JOINTS))}")
     if not args.yes:
@@ -1106,6 +1525,11 @@ def main() -> int:
             targeter = D405YoloTargeter(args)
             targeter.start()
             print("Priming D405 YOLO once before the RPS game.")
+            targeter.prime()
+        elif args.pick_source == "homography":
+            targeter = D405HomographyPlanarTargeter(args)
+            targeter.start()
+            print("Priming fixed D405 homography YOLO once before the RPS game.")
             targeter.prime()
         robot.connect()
         print_raw_status(robot, "after connect")
@@ -1153,6 +1577,11 @@ def main() -> int:
                 if args.pick_source == "fixed":
                     ok = run_fixed_pick(controller, args, rps_joints)
                     print(f"fixed pick {'complete' if ok else 'failed'}")
+                elif args.pick_source == "homography":
+                    if targeter is None:
+                        raise RuntimeError("D405 homography targeter is not initialized")
+                    ok = run_homography_planar_pick(controller, targeter, args)
+                    print(f"homography pick {'complete' if ok else 'failed'}")
                 else:
                     if targeter is None:
                         raise RuntimeError("D405 YOLO targeter is not initialized")
@@ -1181,7 +1610,10 @@ def main() -> int:
         if recognizer is not None:
             recognizer.close()
         if camera is not None:
-            camera.stop()
+            try:
+                camera.stop()
+            except Exception as exc:
+                print(f"[warn] D435i stop skipped: {exc}")
         cv2.destroyAllWindows()
         if robot.is_connected:
             if args.disconnect_prompt:

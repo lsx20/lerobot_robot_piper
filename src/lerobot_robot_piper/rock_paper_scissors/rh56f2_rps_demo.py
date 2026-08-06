@@ -216,9 +216,11 @@ class D455ColorCamera:
         if serial:
             self.config.enable_device(serial)
         self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        self.started = False
 
     def start(self) -> None:
         self.pipeline.start(self.config)
+        self.started = True
 
     def read(self) -> np.ndarray | None:
         frames = self.pipeline.wait_for_frames()
@@ -228,7 +230,9 @@ class D455ColorCamera:
         return np.asanyarray(color_frame.get_data())
 
     def stop(self) -> None:
-        self.pipeline.stop()
+        if self.started:
+            self.pipeline.stop()
+            self.started = False
 
 
 def parse_args() -> argparse.Namespace:
