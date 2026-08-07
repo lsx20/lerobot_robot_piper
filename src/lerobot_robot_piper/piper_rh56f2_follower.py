@@ -226,6 +226,10 @@ class PiperRH56F2Follower(Robot):
             for name, value in zip(JOINT_NAMES, values, strict=True)
         }
 
+    @check_if_not_connected
+    def get_arm_joint_positions(self) -> RobotObservation:
+        return self._arm_current_deg()
+
     def _ee_current_mm_deg(self) -> dict[str, float]:
         end_pose = self.piper.GetArmEndPoseMsgs().end_pose
         values = [

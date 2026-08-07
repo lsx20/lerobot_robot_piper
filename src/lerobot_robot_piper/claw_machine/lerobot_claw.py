@@ -15,6 +15,7 @@ The controller talks to hardware through the LeRobot Robot surface:
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import select
 import struct
@@ -23,6 +24,7 @@ import termios
 import threading
 import time
 import tty
+from contextlib import ExitStack
 from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -324,6 +326,7 @@ class ClawMachineTaskConfig:
     gamepad_stop_reset: bool = True
     gamepad_pick_button: int = 0
     gamepad_stop_button: int = 1
+    gamepad_log_csv: Path | None = None
     ball_classifier_config: BallClassifierConfig | None = None
 
 
@@ -562,7 +565,8 @@ class ClawMachineController:
         return {name: float(obs[name]) for name in EE_POSE_NAMES}
 
     def current_joints(self) -> list[float]:
-        obs = self.observation()
+        fast_reader = getattr(self.robot, "get_arm_joint_positions", None)
+        obs = fast_reader() if callable(fast_reader) else self.observation()
         return [float(obs[key]) for key in JOINT_KEYS]
 
     def joint_action(self, joints: list[float], speed: int | None = None) -> RobotAction:
@@ -1429,7 +1433,28 @@ class ClawMachineController:
         self.print_gamepad_help()
         self.close_for_teleop()
 
-        with LinuxJoystick(self.config.gamepad_device) as joystick:
+        log_file = None
+        log_writer = None
+        log_started = time.monotonic()
+        last_log_flush = log_started
+        if self.config.gamepad_log_csv is not None:
+            log_path = self.config.gamepad_log_csv.expanduser()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = log_path.open("w", newline="")
+            log_writer = csv.writer(log_file)
+            log_writer.writerow(
+                ["elapsed_s", "dt_s", "x_axis", "reach_axis", "moving", "phase"]
+                + [f"target_j{index}" for index in range(1, 7)]
+                + [f"actual_j{index}" for index in range(1, 7)]
+                + [f"error_j{index}" for index in range(1, 7)]
+            )
+            log_file.flush()
+            print(f"Gamepad telemetry CSV: {log_path}")
+
+        with ExitStack() as stack:
+            if log_file is not None:
+                stack.callback(log_file.close)
+            joystick = stack.enter_context(LinuxJoystick(self.config.gamepad_device))
             last_loop = time.monotonic()
             last_print = 0.0
             was_moving = False
@@ -1527,6 +1552,7 @@ class ClawMachineController:
                     phases.append(phase)
                     moved = True
 
+                actual_joints = None
                 if moved:
                     actual_joints = self.current_joints()
                     joint_target = clamp_target_lead(
@@ -1557,6 +1583,30 @@ class ClawMachineController:
                         flush=True,
                     )
                     was_moving = False
+
+                if log_writer is not None:
+                    if actual_joints is None:
+                        actual_joints = self.current_joints()
+                    errors = [
+                        target - actual
+                        for target, actual in zip(joint_target, actual_joints, strict=True)
+                    ]
+                    log_writer.writerow(
+                        [
+                            now - log_started,
+                            dt_s,
+                            x_axis,
+                            reach_axis,
+                            int(moved),
+                            "+".join(phases),
+                        ]
+                        + joint_target
+                        + actual_joints
+                        + errors
+                    )
+                    if now - last_log_flush >= 1.0:
+                        log_file.flush()
+                        last_log_flush = now
 
                 select.select([], [], [], 1.0 / self.config.rate_hz)
 
@@ -1695,6 +1745,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gamepad-stop-reset", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gamepad-pick-button", type=int, default=0)
     parser.add_argument("--gamepad-stop-button", type=int, default=1)
+    parser.add_argument(
+        "--gamepad-log-csv",
+        type=Path,
+        help="Optional CSV path for gamepad axes and target/actual joint telemetry.",
+    )
     parser.add_argument(
         "--classify-ball",
         action=argparse.BooleanOptionalAction,
@@ -1944,6 +1999,7 @@ def config_from_args(args: argparse.Namespace) -> ClawMachineTaskConfig:
         gamepad_stop_reset=args.gamepad_stop_reset,
         gamepad_pick_button=args.gamepad_pick_button,
         gamepad_stop_button=args.gamepad_stop_button,
+        gamepad_log_csv=args.gamepad_log_csv,
         ball_classifier_config=ball_classifier_config,
     )
 
